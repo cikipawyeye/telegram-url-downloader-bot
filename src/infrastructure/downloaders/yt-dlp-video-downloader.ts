@@ -22,6 +22,7 @@ export class YtDlpVideoDownloader implements VideoDownloader {
     const { onProgress, outputDir, url } = request;
     const outputTemplate = path.join(outputDir, '%(title).120s [%(id)s].%(ext)s');
     const download = this.ytdlp.download(url, {
+      jsRuntime: '',
       mergeOutputFormat: 'mp4',
       noPlaylist: true,
       output: outputTemplate,

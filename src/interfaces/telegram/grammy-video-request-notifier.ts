@@ -65,6 +65,7 @@ export class GrammyVideoRequestNotifier implements VideoRequestNotifier {
     const media = screenshots.map((screenshot) => ({
       type: 'photo' as const,
       media: new InputFile(screenshot.filePath, screenshot.fileName),
+      caption: screenshot.caption,
     }));
 
     await this.bot.api.sendMediaGroup(this.getChatId(), media);

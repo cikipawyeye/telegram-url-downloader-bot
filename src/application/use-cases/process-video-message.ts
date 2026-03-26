@@ -80,14 +80,14 @@ export class ProcessVideoMessageUseCase {
 
       await notifier.updateStatus(
         acceptedMessage,
-        'Download selesai. Sedang membuat 10 screenshot video...',
+        'Download selesai. Sedang membuat 5 screenshot video...',
       );
 
       const screenshots = await this.videoScreenshotGenerator.generate({
         videoPath: result.filePath,
         outputDir,
         durationSeconds: result.durationSeconds,
-        count: 10,
+        count: 5,
       });
 
       await notifier.updateStatus(
