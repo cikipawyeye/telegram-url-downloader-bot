@@ -12,6 +12,19 @@ Bot ini menerima URL dari user, mencoba mengunduh videonya dengan `yt-dlp`, lalu
 - health check endpoint
 
 ## Arsitektur singkat
+Struktur kode sekarang dipisah menjadi beberapa layer:
+
+```text
+src/
+  index.ts                  # composition root / bootstrap
+  config/                   # load env dan app config
+  domain/                   # entity + helper murni
+  application/             # port + use case
+  infrastructure/          # filesystem, process runner, yt-dlp adapter
+  interfaces/              # adapter Express dan Telegram
+```
+
+Alur request tetap sama:
 1. User mengirim URL ke bot
 2. Server menerima webhook Telegram
 3. Server menjalankan `yt-dlp`
@@ -26,6 +39,9 @@ Contoh:
 - `TELEGRAM_API_ROOT=http://127.0.0.1:8081`
 
 Kalau pakai Bot API Telegram standar, limit upload bot jauh lebih kecil.
+
+Sebelum menjalankan local bot, logout di API Telegram standar: `curl "https://api.telegram.o
+rg/bot<TOKEN>/logOut"`
 
 ## Environment
 Salin `.env.example` menjadi `.env` lalu isi nilainya.
