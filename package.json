@@ -1,0 +1,28 @@
+{
+  "name": "telegram-video-downloader-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Telegram bot that downloads a video from a user-sent URL and sends it back as a streamable Telegram video.",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@grammyjs/files": "^1.1.1",
+    "dotenv": "^16.5.0",
+    "express": "^4.21.2",
+    "grammy": "^1.38.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.1",
+    "@types/node": "^22.13.10",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}

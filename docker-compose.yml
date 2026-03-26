@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    container_name: telegram-video-downloader-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${PORT:-3000}:3000"
+    volumes:
+      - bot_tmp:${DOWNLOAD_DIR:-/tmp/telegram-video-bot}
+
+volumes:
+  bot_tmp:
