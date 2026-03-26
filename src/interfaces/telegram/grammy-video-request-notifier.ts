@@ -1,5 +1,5 @@
 import { InputFile, type Bot, type Context } from 'grammy';
-import type { OutboundVideo, StatusMessage, VideoRequestNotifier } from '../../application/ports/video-request-notifier.js';
+import type { OutboundScreenshot, OutboundVideo, StatusMessage, VideoRequestNotifier } from '../../application/ports/video-request-notifier.js';
 
 export class GrammyVideoRequestNotifier implements VideoRequestNotifier {
   private readonly bot: Bot<Context>;
@@ -59,6 +59,15 @@ export class GrammyVideoRequestNotifier implements VideoRequestNotifier {
         caption: video.caption,
       },
     );
+  }
+
+  async sendScreenshots(screenshots: OutboundScreenshot[]): Promise<void> {
+    const media = screenshots.map((screenshot) => ({
+      type: 'photo' as const,
+      media: new InputFile(screenshot.filePath, screenshot.fileName),
+    }));
+
+    await this.bot.api.sendMediaGroup(this.getChatId(), media);
   }
 
   private getChatId(): number {

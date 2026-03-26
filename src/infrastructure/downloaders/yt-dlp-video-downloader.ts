@@ -85,12 +85,13 @@ export class YtDlpVideoDownloader implements VideoDownloader {
     if (directFilePath) {
       const stat = await fsp.stat(directFilePath);
 
-      return {
-        filePath: directFilePath,
-        fileSize: stat.size,
-        title,
-      };
-    }
+    return {
+      filePath: directFilePath,
+      fileSize: stat.size,
+      title,
+      durationSeconds: result.info[0]?.duration,
+    };
+  }
 
     return await this.resolveDownloadedVideoFromDirectory(outputDir, title);
   }
@@ -124,6 +125,7 @@ export class YtDlpVideoDownloader implements VideoDownloader {
       filePath: bestFile,
       fileSize: bestStat.size,
       title,
+      durationSeconds: undefined,
     };
   }
 }

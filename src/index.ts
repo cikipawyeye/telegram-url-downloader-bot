@@ -5,6 +5,7 @@ import { YtDlp } from 'ytdlp-nodejs';
 import { ProcessVideoMessageUseCase } from './application/use-cases/process-video-message.js';
 import { loadConfig } from './config/app-config.js';
 import { YtDlpVideoDownloader } from './infrastructure/downloaders/yt-dlp-video-downloader.js';
+import { FfmpegVideoScreenshotGenerator } from './infrastructure/previews/ffmpeg-video-screenshot-generator.js';
 import { FileSystemDownloadWorkspaceStore } from './infrastructure/storage/file-system-download-workspace-store.js';
 import { createHttpApp } from './interfaces/http/create-http-app.js';
 import { registerBotHandlers } from './interfaces/telegram/register-bot-handlers.js';
@@ -30,6 +31,9 @@ async function bootstrap(): Promise<void> {
     videoDownloader: new YtDlpVideoDownloader({
       downloadTimeoutMs: config.downloadTimeoutMs,
       ytdlp: new YtDlp(),
+    }),
+    videoScreenshotGenerator: new FfmpegVideoScreenshotGenerator({
+      commandTimeoutMs: Math.min(config.downloadTimeoutMs, 120_000),
     }),
     workspaceStore,
   });

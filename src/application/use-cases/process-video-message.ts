@@ -1,11 +1,13 @@
 import type { DownloadWorkspace, DownloadWorkspaceStore } from '../ports/download-workspace-store.js';
 import type { VideoDownloader } from '../ports/video-downloader.js';
 import type { StatusMessage, VideoRequestNotifier } from '../ports/video-request-notifier.js';
+import type { VideoScreenshotGenerator } from '../ports/video-screenshot-generator.js';
 import { buildDeliveryFileName, extractFirstUrl, formatBytes, formatDownloadProgress, truncateCaption, type VideoDownloadProgress } from '../../domain/video.js';
 
 type ProcessVideoMessageUseCaseDependencies = {
   maxFileSizeBytes: number;
   videoDownloader: VideoDownloader;
+  videoScreenshotGenerator: VideoScreenshotGenerator;
   workspaceStore: DownloadWorkspaceStore;
 };
 
@@ -18,11 +20,13 @@ export type ProcessVideoMessageRequest = {
 export class ProcessVideoMessageUseCase {
   private readonly maxFileSizeBytes: number;
   private readonly videoDownloader: VideoDownloader;
+  private readonly videoScreenshotGenerator: VideoScreenshotGenerator;
   private readonly workspaceStore: DownloadWorkspaceStore;
 
   constructor(dependencies: ProcessVideoMessageUseCaseDependencies) {
     this.maxFileSizeBytes = dependencies.maxFileSizeBytes;
     this.videoDownloader = dependencies.videoDownloader;
+    this.videoScreenshotGenerator = dependencies.videoScreenshotGenerator;
     this.workspaceStore = dependencies.workspaceStore;
   }
 
@@ -76,7 +80,26 @@ export class ProcessVideoMessageUseCase {
 
       await notifier.updateStatus(
         acceptedMessage,
-        'Download selesai. Sedang mengirim video ke Telegram...',
+        'Download selesai. Sedang membuat 10 screenshot video...',
+      );
+
+      const screenshots = await this.videoScreenshotGenerator.generate({
+        videoPath: result.filePath,
+        outputDir,
+        durationSeconds: result.durationSeconds,
+        count: 10,
+      });
+
+      await notifier.updateStatus(
+        acceptedMessage,
+        'Screenshot selesai. Sedang mengirim screenshot ke Telegram...',
+      );
+
+      await notifier.sendScreenshots(screenshots);
+
+      await notifier.updateStatus(
+        acceptedMessage,
+        'Screenshot terkirim. Sedang mengirim video ke Telegram...',
       );
 
       await notifier.sendVideo({
