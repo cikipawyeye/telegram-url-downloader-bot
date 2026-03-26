@@ -22,6 +22,7 @@ export class YtDlpVideoDownloader implements VideoDownloader {
     const { onProgress, outputDir, url } = request;
     const outputTemplate = path.join(outputDir, '%(title).120s [%(id)s].%(ext)s');
     const download = this.ytdlp.download(url, {
+      jsRuntime: '',
       mergeOutputFormat: 'mp4',
       noPlaylist: true,
       output: outputTemplate,
@@ -85,12 +86,13 @@ export class YtDlpVideoDownloader implements VideoDownloader {
     if (directFilePath) {
       const stat = await fsp.stat(directFilePath);
 
-      return {
-        filePath: directFilePath,
-        fileSize: stat.size,
-        title,
-      };
-    }
+    return {
+      filePath: directFilePath,
+      fileSize: stat.size,
+      title,
+      durationSeconds: result.info[0]?.duration,
+    };
+  }
 
     return await this.resolveDownloadedVideoFromDirectory(outputDir, title);
   }
@@ -124,6 +126,7 @@ export class YtDlpVideoDownloader implements VideoDownloader {
       filePath: bestFile,
       fileSize: bestStat.size,
       title,
+      durationSeconds: undefined,
     };
   }
 }

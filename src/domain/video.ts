@@ -4,6 +4,7 @@ export type DownloadedVideo = {
   filePath: string;
   fileSize: number;
   title: string;
+  durationSeconds?: number;
 };
 
 export type VideoDownloadProgress = {
@@ -83,6 +84,39 @@ export function formatDownloadProgress(progress: VideoDownloadProgress): string 
   }
 
   return lines.join('\n');
+}
+
+export type VideoScreenshotPlanItem = {
+  fileName: string;
+  captureSeconds: number;
+  displaySeconds: number;
+  caption: string;
+};
+
+export function buildScreenshotPlan(durationSeconds: number, screenshotCount: number): VideoScreenshotPlanItem[] {
+  const normalizedDurationSeconds = Math.max(durationSeconds, 1);
+  const maxCaptureSeconds = Math.max(0, normalizedDurationSeconds - Math.min(1, normalizedDurationSeconds / 20));
+
+  return Array.from({ length: screenshotCount }, (_unused, index) => {
+    const displaySeconds = normalizedDurationSeconds * ((index + 1) / screenshotCount);
+    const captureSeconds = Math.min(displaySeconds, maxCaptureSeconds);
+
+    return {
+      fileName: `screenshot-${String(index + 1).padStart(2, '0')}.jpg`,
+      captureSeconds,
+      displaySeconds,
+      caption: `Screenshot at ${formatClockTimestamp(displaySeconds)}`,
+    };
+  });
+}
+
+export function formatClockTimestamp(totalSeconds: number): string {
+  const roundedSeconds = Math.max(0, Math.round(totalSeconds));
+  const hours = Math.floor(roundedSeconds / 3600);
+  const minutes = Math.floor((roundedSeconds % 3600) / 60);
+  const seconds = roundedSeconds % 60;
+
+  return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 }
 
 function formatDuration(totalSeconds: number): string {
