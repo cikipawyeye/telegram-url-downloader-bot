@@ -1,10 +1,10 @@
 import 'dotenv/config';
 import { hydrateFiles } from '@grammyjs/files';
 import { Bot, type Context, webhookCallback } from 'grammy';
+import { YtDlp } from 'ytdlp-nodejs';
 import { ProcessVideoMessageUseCase } from './application/use-cases/process-video-message.js';
 import { loadConfig } from './config/app-config.js';
 import { YtDlpVideoDownloader } from './infrastructure/downloaders/yt-dlp-video-downloader.js';
-import { CommandRunner } from './infrastructure/process/command-runner.js';
 import { FileSystemDownloadWorkspaceStore } from './infrastructure/storage/file-system-download-workspace-store.js';
 import { createHttpApp } from './interfaces/http/create-http-app.js';
 import { registerBotHandlers } from './interfaces/telegram/register-bot-handlers.js';
@@ -28,8 +28,8 @@ async function bootstrap(): Promise<void> {
   const processVideoMessage = new ProcessVideoMessageUseCase({
     maxFileSizeBytes: config.maxFileSizeBytes,
     videoDownloader: new YtDlpVideoDownloader({
-      commandRunner: new CommandRunner(),
       downloadTimeoutMs: config.downloadTimeoutMs,
+      ytdlp: new YtDlp(),
     }),
     workspaceStore,
   });

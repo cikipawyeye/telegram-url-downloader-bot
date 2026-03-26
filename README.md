@@ -43,6 +43,8 @@ Kalau pakai Bot API Telegram standar, limit upload bot jauh lebih kecil.
 Sebelum menjalankan local bot, logout di API Telegram standar: `curl "https://api.telegram.o
 rg/bot<TOKEN>/logOut"`
 
+See: https://github.com/tdlib/telegram-bot-api
+
 ## Environment
 Salin `.env.example` menjadi `.env` lalu isi nilainya.
 
@@ -71,7 +73,8 @@ Webhook akan dibuat otomatis ke:
 - `GET /health`
 
 ## Catatan operasional
-- Pastikan `ffmpeg` dan `yt-dlp` tersedia
+- `ytdlp-nodejs` akan mengelola binary `yt-dlp` saat dependency di-install
+- Pastikan `ffmpeg` tersedia untuk proses merge/remux yang dibutuhkan `yt-dlp`
 - Gunakan storage SSD
 - Jadwalkan monitoring disk usage
 - Untuk trafik besar, pindahkan proses download ke queue/worker terpisah

@@ -1,7 +1,7 @@
 import type { DownloadWorkspace, DownloadWorkspaceStore } from '../ports/download-workspace-store.js';
 import type { VideoDownloader } from '../ports/video-downloader.js';
 import type { StatusMessage, VideoRequestNotifier } from '../ports/video-request-notifier.js';
-import { buildDeliveryFileName, extractFirstUrl, formatBytes, truncateCaption } from '../../domain/video.js';
+import { buildDeliveryFileName, extractFirstUrl, formatBytes, formatDownloadProgress, truncateCaption, type VideoDownloadProgress } from '../../domain/video.js';
 
 type ProcessVideoMessageUseCaseDependencies = {
   maxFileSizeBytes: number;
@@ -57,7 +57,13 @@ export class ProcessVideoMessageUseCase {
     url: string,
   ): Promise<void> {
     try {
-      const result = await this.videoDownloader.download(url, outputDir);
+      const result = await this.videoDownloader.download({
+        url,
+        outputDir,
+        onProgress: (progress) => {
+          void this.reportDownloadProgress(notifier, acceptedMessage, progress);
+        },
+      });
 
       if (result.fileSize > this.maxFileSizeBytes) {
         await notifier.updateStatus(
@@ -84,6 +90,22 @@ export class ProcessVideoMessageUseCase {
       await notifier.updateStatus(acceptedMessage, `Gagal memproses link.\n${message}`);
     } finally {
       await this.workspaceStore.remove({ dirPath: outputDir });
+    }
+  }
+
+  private async reportDownloadProgress(
+    notifier: VideoRequestNotifier,
+    acceptedMessage: StatusMessage,
+    progress: VideoDownloadProgress,
+  ): Promise<void> {
+    if (progress.status !== 'downloading') {
+      return;
+    }
+
+    try {
+      await notifier.updateProgress(acceptedMessage, formatDownloadProgress(progress));
+    } catch (error) {
+      console.error('Failed to update download progress:', error);
     }
   }
 }
