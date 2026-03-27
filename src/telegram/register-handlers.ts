@@ -1,10 +1,10 @@
 import type { Bot, Context } from 'grammy';
-import type { ProcessVideoMessageUseCase } from '../../application/use-cases/process-video-message.js';
-import { GrammyVideoRequestNotifier } from './grammy-video-request-notifier.js';
+import { TelegramNotifier } from './notifier.js';
+import type { VideoMessageProcessor } from '../video/process-message.js';
 
 export function registerBotHandlers(
   bot: Bot<Context>,
-  processVideoMessage: ProcessVideoMessageUseCase,
+  videoMessageProcessor: VideoMessageProcessor,
 ): void {
   bot.command('start', async (ctx) => {
     await ctx.reply(
@@ -17,8 +17,8 @@ export function registerBotHandlers(
   });
 
   bot.on('message:text', async (ctx) => {
-    await processVideoMessage.execute({
-      notifier: new GrammyVideoRequestNotifier(ctx, bot),
+    await videoMessageProcessor.process({
+      notifier: new TelegramNotifier(ctx, bot),
       text: ctx.message.text,
       userId: String(ctx.from?.id ?? 'unknown'),
     });

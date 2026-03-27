@@ -1,9 +1,12 @@
 import crypto from 'node:crypto';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import type { DownloadWorkspace, DownloadWorkspaceStore } from '../../application/ports/download-workspace-store.js';
 
-export class FileSystemDownloadWorkspaceStore implements DownloadWorkspaceStore {
+export type DownloadWorkspace = {
+  dirPath: string;
+};
+
+export class WorkspaceManager {
   private readonly rootDir: string;
 
   constructor(rootDir: string) {

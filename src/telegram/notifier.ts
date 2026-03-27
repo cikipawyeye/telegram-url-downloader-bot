@@ -1,7 +1,17 @@
 import { InputFile, type Bot, type Context } from 'grammy';
-import type { OutboundScreenshot, OutboundVideo, StatusMessage, VideoRequestNotifier } from '../../application/ports/video-request-notifier.js';
+import type { VideoScreenshot } from '../video/utils.js';
 
-export class GrammyVideoRequestNotifier implements VideoRequestNotifier {
+export type StatusMessage = {
+  messageId: number;
+};
+
+export type OutboundVideo = {
+  filePath: string;
+  fileName: string;
+  caption: string;
+};
+
+export class TelegramNotifier {
   private readonly bot: Bot<Context>;
   private readonly ctx: Context;
   private readonly minProgressUpdateIntervalMs = 1500;
@@ -50,6 +60,15 @@ export class GrammyVideoRequestNotifier implements VideoRequestNotifier {
     }, waitMs);
   }
 
+  async sendScreenshots(screenshots: VideoScreenshot[]): Promise<void> {
+    const media = screenshots.map((screenshot) => ({
+      type: 'photo' as const,
+      media: new InputFile(screenshot.filePath, screenshot.fileName),
+    }));
+
+    await this.bot.api.sendMediaGroup(this.getChatId(), media);
+  }
+
   async sendVideo(video: OutboundVideo): Promise<void> {
     await this.bot.api.sendVideo(
       this.getChatId(),
@@ -59,16 +78,6 @@ export class GrammyVideoRequestNotifier implements VideoRequestNotifier {
         caption: video.caption,
       },
     );
-  }
-
-  async sendScreenshots(screenshots: OutboundScreenshot[]): Promise<void> {
-    const media = screenshots.map((screenshot) => ({
-      type: 'photo' as const,
-      media: new InputFile(screenshot.filePath, screenshot.fileName),
-      caption: screenshot.caption,
-    }));
-
-    await this.bot.api.sendMediaGroup(this.getChatId(), media);
   }
 
   private getChatId(): number {
