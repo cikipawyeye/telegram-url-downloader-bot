@@ -11,17 +11,17 @@ Bot ini menerima URL dari user, mencoba mengunduh videonya dengan `yt-dlp`, lalu
 - pembatasan ukuran file
 - health check endpoint
 
-## Arsitektur singkat
-Struktur kode sekarang dipisah menjadi beberapa layer:
+## Struktur kode
+Struktur kode sekarang dibuat lebih langsung per kebutuhan fitur, bukan per layer:
 
 ```text
 src/
-  index.ts                  # composition root / bootstrap
-  config/                   # load env dan app config
-  domain/                   # entity + helper murni
-  application/             # port + use case
-  infrastructure/          # filesystem, process runner, yt-dlp adapter
-  interfaces/              # adapter Express dan Telegram
+  index.ts                  # bootstrap aplikasi
+  config.ts                 # load environment config
+  http/                     # Express app dan endpoint health check
+  storage/                  # workspace temp file
+  telegram/                 # handler dan notifier Telegram
+  video/                    # download, screenshot, util, dan flow utama
 ```
 
 Alur request tetap sama:
@@ -29,8 +29,9 @@ Alur request tetap sama:
 2. Server menerima webhook Telegram
 3. Server menjalankan `yt-dlp`
 4. File disimpan sementara
-5. Bot mengirim video ke user
-6. File sementara dihapus
+5. Bot membuat 5 screenshot dari durasi video
+6. Bot mengirim screenshot lalu video ke user
+7. File sementara dihapus
 
 ## Penting
 Agar bot bisa mengirim file besar, sebaiknya gunakan **local/self-hosted Telegram Bot API** dan isi `TELEGRAM_API_ROOT`.

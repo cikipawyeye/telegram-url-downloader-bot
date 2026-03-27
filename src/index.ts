@@ -2,13 +2,13 @@ import 'dotenv/config';
 import { hydrateFiles } from '@grammyjs/files';
 import { Bot, type Context, webhookCallback } from 'grammy';
 import { YtDlp } from 'ytdlp-nodejs';
-import { ProcessVideoMessageUseCase } from './application/use-cases/process-video-message.js';
-import { loadConfig } from './config/app-config.js';
-import { YtDlpVideoDownloader } from './infrastructure/downloaders/yt-dlp-video-downloader.js';
-import { FfmpegVideoScreenshotGenerator } from './infrastructure/previews/ffmpeg-video-screenshot-generator.js';
-import { FileSystemDownloadWorkspaceStore } from './infrastructure/storage/file-system-download-workspace-store.js';
-import { createHttpApp } from './interfaces/http/create-http-app.js';
-import { registerBotHandlers } from './interfaces/telegram/register-bot-handlers.js';
+import { loadConfig } from './config.js';
+import { createHttpApp } from './http/create-app.js';
+import { WorkspaceManager } from './storage/workspace.js';
+import { registerBotHandlers } from './telegram/register-handlers.js';
+import { VideoDownloader } from './video/downloader.js';
+import { VideoMessageProcessor } from './video/process-message.js';
+import { VideoScreenshotGenerator } from './video/screenshots.js';
 
 const config = loadConfig();
 
@@ -23,24 +23,24 @@ async function bootstrap(): Promise<void> {
 
   bot.api.config.use(hydrateFiles(config.botToken));
 
-  const workspaceStore = new FileSystemDownloadWorkspaceStore(config.downloadDir);
-  await workspaceStore.prepareRoot();
+  const workspaceManager = new WorkspaceManager(config.downloadDir);
+  await workspaceManager.prepareRoot();
 
-  const processVideoMessage = new ProcessVideoMessageUseCase({
+  const videoMessageProcessor = new VideoMessageProcessor({
     maxFileSizeBytes: config.maxFileSizeBytes,
-    videoDownloader: new YtDlpVideoDownloader({
+    videoDownloader: new VideoDownloader({
       downloadTimeoutMs: config.downloadTimeoutMs,
       ytdlp: new YtDlp(),
     }),
-    videoScreenshotGenerator: new FfmpegVideoScreenshotGenerator({
+    videoScreenshotGenerator: new VideoScreenshotGenerator({
       commandTimeoutMs: Math.min(config.downloadTimeoutMs, 120_000),
     }),
-    workspaceStore,
+    workspaceManager,
   });
 
-  registerBotHandlers(bot, processVideoMessage);
+  registerBotHandlers(bot, videoMessageProcessor);
 
-  const app = createHttpApp({ downloadDir: config.downloadDir });
+  const app = createHttpApp(config.downloadDir);
   const webhookPath = `/telegram/webhook/${config.webhookSecret}`;
 
   app.use(webhookPath, webhookCallback(bot, 'express'));

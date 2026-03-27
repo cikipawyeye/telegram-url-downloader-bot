@@ -1,25 +1,24 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { type DownloadFinishResult, type VideoProgress as YtDlpVideoProgress, YtDlp } from 'ytdlp-nodejs';
-import type { DownloadVideoRequest, VideoDownloader } from '../../application/ports/video-downloader.js';
-import type { DownloadedVideo, VideoDownloadProgress } from '../../domain/video.js';
+import { type DownloadedVideo, type VideoDownloadProgress } from './utils.js';
 
-type YtDlpVideoDownloaderDependencies = {
-  downloadTimeoutMs: number;
-  ytdlp: YtDlp;
+export type DownloadVideoOptions = {
+  url: string;
+  outputDir: string;
+  onProgress?: (progress: VideoDownloadProgress) => void;
 };
 
-export class YtDlpVideoDownloader implements VideoDownloader {
+export class VideoDownloader {
   private readonly downloadTimeoutMs: number;
   private readonly ytdlp: YtDlp;
 
-  constructor(dependencies: YtDlpVideoDownloaderDependencies) {
-    this.downloadTimeoutMs = dependencies.downloadTimeoutMs;
-    this.ytdlp = dependencies.ytdlp;
+  constructor(options: { downloadTimeoutMs: number; ytdlp: YtDlp }) {
+    this.downloadTimeoutMs = options.downloadTimeoutMs;
+    this.ytdlp = options.ytdlp;
   }
 
-  async download(request: DownloadVideoRequest): Promise<DownloadedVideo> {
-    const { onProgress, outputDir, url } = request;
+  async download({ onProgress, outputDir, url }: DownloadVideoOptions): Promise<DownloadedVideo> {
     const outputTemplate = path.join(outputDir, '%(title).120s [%(id)s].%(ext)s');
     const download = this.ytdlp.download(url, {
       jsRuntime: '',
@@ -86,13 +85,13 @@ export class YtDlpVideoDownloader implements VideoDownloader {
     if (directFilePath) {
       const stat = await fsp.stat(directFilePath);
 
-    return {
-      filePath: directFilePath,
-      fileSize: stat.size,
-      title,
-      durationSeconds: result.info[0]?.duration,
-    };
-  }
+      return {
+        filePath: directFilePath,
+        fileSize: stat.size,
+        title,
+        durationSeconds: result.info[0]?.duration,
+      };
+    }
 
     return await this.resolveDownloadedVideoFromDirectory(outputDir, title);
   }
@@ -126,7 +125,6 @@ export class YtDlpVideoDownloader implements VideoDownloader {
       filePath: bestFile,
       fileSize: bestStat.size,
       title,
-      durationSeconds: undefined,
     };
   }
 }

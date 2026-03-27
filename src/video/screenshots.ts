@@ -1,33 +1,41 @@
 import { spawn } from 'node:child_process';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import type { GenerateVideoScreenshotsRequest, GeneratedVideoScreenshot, VideoScreenshotGenerator } from '../../application/ports/video-screenshot-generator.js';
-import { buildScreenshotPlan } from '../../domain/video.js';
+import { buildScreenshotPlan, type VideoScreenshot } from './utils.js';
 
-type FfmpegVideoScreenshotGeneratorDependencies = {
-  commandTimeoutMs: number;
+export type GenerateScreenshotsOptions = {
+  videoPath: string;
+  outputDir: string;
+  durationSeconds?: number;
+  count: number;
 };
 
-export class FfmpegVideoScreenshotGenerator implements VideoScreenshotGenerator {
+export class VideoScreenshotGenerator {
   private readonly commandTimeoutMs: number;
 
-  constructor(dependencies: FfmpegVideoScreenshotGeneratorDependencies) {
-    this.commandTimeoutMs = dependencies.commandTimeoutMs;
+  constructor(options: { commandTimeoutMs: number }) {
+    this.commandTimeoutMs = options.commandTimeoutMs;
   }
 
-  async generate(request: GenerateVideoScreenshotsRequest): Promise<GeneratedVideoScreenshot[]> {
-    const outputDir = path.join(request.outputDir, 'screenshots');
-    await fsp.mkdir(outputDir, { recursive: true });
+  async generate({
+    count,
+    durationSeconds,
+    outputDir,
+    videoPath,
+  }: GenerateScreenshotsOptions): Promise<VideoScreenshot[]> {
+    const screenshotsDir = path.join(outputDir, 'screenshots');
+    await fsp.mkdir(screenshotsDir, { recursive: true });
 
-    const durationSeconds =
-      request.durationSeconds !== undefined && request.durationSeconds > 0
-        ? request.durationSeconds
-        : await this.probeDuration(request.videoPath);
-    const screenshotPlan = buildScreenshotPlan(durationSeconds, request.count);
-    const screenshots: GeneratedVideoScreenshot[] = [];
+    const resolvedDurationSeconds =
+      durationSeconds !== undefined && durationSeconds > 0
+        ? durationSeconds
+        : await this.probeDuration(videoPath);
+
+    const screenshotPlan = buildScreenshotPlan(resolvedDurationSeconds, count);
+    const screenshots: VideoScreenshot[] = [];
 
     for (const item of screenshotPlan) {
-      const filePath = path.join(outputDir, item.fileName);
+      const filePath = path.join(screenshotsDir, item.fileName);
 
       await this.runCommand('ffmpeg', [
         '-y',
@@ -36,7 +44,7 @@ export class FfmpegVideoScreenshotGenerator implements VideoScreenshotGenerator 
         '-ss',
         item.captureSeconds.toFixed(3),
         '-i',
-        request.videoPath,
+        videoPath,
         '-frames:v',
         '1',
         '-q:v',
@@ -49,7 +57,6 @@ export class FfmpegVideoScreenshotGenerator implements VideoScreenshotGenerator 
       screenshots.push({
         filePath,
         fileName: item.fileName,
-        caption: item.caption,
       });
     }
 
