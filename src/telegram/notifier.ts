@@ -19,6 +19,7 @@ export class TelegramNotifier {
   private lastProgressUpdateAt = 0;
   private pendingProgressTimer: NodeJS.Timeout | null = null;
   private pendingProgressText: string | null = null;
+  private statusMessageClosed = false;
   private statusUpdateChain: Promise<void> = Promise.resolve();
 
   constructor(ctx: Context, bot: Bot<Context>) {
@@ -33,15 +34,24 @@ export class TelegramNotifier {
   async sendAccepted(): Promise<StatusMessage> {
     const message = await this.ctx.reply('Link diterima. Sedang mencoba mendownload video...');
     this.lastStatusText = message.text;
+    this.statusMessageClosed = false;
     return { messageId: message.message_id };
   }
 
   async updateStatus(statusMessage: StatusMessage, text: string): Promise<void> {
+    if (this.statusMessageClosed) {
+      return;
+    }
+
     this.clearPendingProgress();
     await this.enqueueStatusUpdate(statusMessage, text);
   }
 
   async updateProgress(statusMessage: StatusMessage, text: string): Promise<void> {
+    if (this.statusMessageClosed) {
+      return;
+    }
+
     if (text === this.lastStatusText || text === this.pendingProgressText) {
       return;
     }
@@ -80,6 +90,21 @@ export class TelegramNotifier {
     );
   }
 
+  async deleteStatus(statusMessage: StatusMessage): Promise<void> {
+    this.clearPendingProgress();
+    this.statusMessageClosed = true;
+
+    this.statusUpdateChain = this.statusUpdateChain
+      .catch(() => undefined)
+      .then(async () => {
+        await this.bot.api.deleteMessage(this.getChatId(), statusMessage.messageId);
+        this.lastStatusText = null;
+        this.lastProgressUpdateAt = 0;
+      });
+
+    await this.statusUpdateChain;
+  }
+
   private getChatId(): number {
     const chatId = this.ctx.chat?.id;
 
@@ -91,6 +116,11 @@ export class TelegramNotifier {
   }
 
   private async flushPendingProgress(statusMessage: StatusMessage): Promise<void> {
+    if (this.statusMessageClosed) {
+      this.pendingProgressText = null;
+      return;
+    }
+
     const text = this.pendingProgressText;
     this.pendingProgressText = null;
 
@@ -113,14 +143,14 @@ export class TelegramNotifier {
   }
 
   private async enqueueStatusUpdate(statusMessage: StatusMessage, text: string): Promise<void> {
-    if (text === this.lastStatusText) {
+    if (this.statusMessageClosed || text === this.lastStatusText) {
       return;
     }
 
     this.statusUpdateChain = this.statusUpdateChain
       .catch(() => undefined)
       .then(async () => {
-        if (text === this.lastStatusText) {
+        if (this.statusMessageClosed || text === this.lastStatusText) {
           return;
         }
 

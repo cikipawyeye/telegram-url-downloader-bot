@@ -36,6 +36,7 @@ async function bootstrap(): Promise<void> {
       commandTimeoutMs: Math.min(config.downloadTimeoutMs, 120_000),
     }),
     workspaceManager,
+    screenshotCount: config.screenshotCount,
   });
 
   registerBotHandlers(bot, videoMessageProcessor);

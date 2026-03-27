@@ -7,6 +7,7 @@ export type AppConfig = {
   downloadDir: string;
   maxFileSizeBytes: number;
   downloadTimeoutMs: number;
+  screenshotCount: number;
 };
 
 export function loadConfig(): AppConfig {
@@ -35,5 +36,6 @@ export function loadConfig(): AppConfig {
     downloadDir: process.env.DOWNLOAD_DIR ?? '/tmp/telegram-video-bot',
     maxFileSizeBytes: Number(process.env.MAX_FILE_SIZE_BYTES ?? 2147483648),
     downloadTimeoutMs: Number(process.env.DOWNLOAD_TIMEOUT_MS ?? 900000),
+    screenshotCount: Number(process.env.SCREENSHOT_COUNT ?? 5),
   };
 }

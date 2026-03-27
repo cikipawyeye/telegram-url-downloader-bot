@@ -16,17 +16,20 @@ export class VideoMessageProcessor {
   private readonly videoDownloader: VideoDownloader;
   private readonly videoScreenshotGenerator: VideoScreenshotGenerator;
   private readonly workspaceManager: WorkspaceManager;
+  private readonly screenshotCount: number;
 
   constructor(options: {
     maxFileSizeBytes: number;
     videoDownloader: VideoDownloader;
     videoScreenshotGenerator: VideoScreenshotGenerator;
     workspaceManager: WorkspaceManager;
+    screenshotCount: number;
   }) {
     this.maxFileSizeBytes = options.maxFileSizeBytes;
     this.videoDownloader = options.videoDownloader;
     this.videoScreenshotGenerator = options.videoScreenshotGenerator;
     this.workspaceManager = options.workspaceManager;
+    this.screenshotCount = options.screenshotCount;
   }
 
   async process({ notifier, text, userId }: ProcessVideoMessageRequest): Promise<void> {
@@ -79,14 +82,14 @@ export class VideoMessageProcessor {
 
       await notifier.updateStatus(
         acceptedMessage,
-        'Download selesai. Sedang membuat 10 screenshot video...',
+        `Download selesai. Sedang membuat ${this.screenshotCount} screenshot video...`,
       );
 
       const screenshots = await this.videoScreenshotGenerator.generate({
         videoPath: video.filePath,
         outputDir,
         durationSeconds: video.durationSeconds,
-        count: 5,
+        count: this.screenshotCount,
       });
 
       await notifier.updateStatus(
@@ -106,6 +109,12 @@ export class VideoMessageProcessor {
         fileName: buildDeliveryFileName(video.filePath),
         caption: truncateCaption(video.title),
       });
+
+      try {
+        await notifier.deleteStatus(acceptedMessage);
+      } catch (error) {
+        console.error('Failed to delete status message:', error);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Terjadi error.';
       await notifier.updateStatus(acceptedMessage, `Gagal memproses link.\n${message}`);
