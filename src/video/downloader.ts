@@ -19,7 +19,7 @@ export class VideoDownloader {
   }
 
   async download({ onProgress, outputDir, url }: DownloadVideoOptions): Promise<DownloadedVideo> {
-    const outputTemplate = path.join(outputDir, '%(title).120s [%(id)s].%(ext)s');
+    const outputTemplate = path.join(outputDir, 'download.%(ext)s');
     const download = this.ytdlp.download(url, {
       jsRuntime: '',
       mergeOutputFormat: 'mp4',

@@ -106,7 +106,7 @@ export class VideoMessageProcessor {
 
       await notifier.sendVideo({
         filePath: video.filePath,
-        fileName: buildDeliveryFileName(video.filePath),
+        fileName: buildDeliveryFileName(video.filePath, video.title),
         caption: truncateCaption(video.title),
       });
 

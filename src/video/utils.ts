@@ -31,8 +31,18 @@ export function extractFirstUrl(text: string): string | null {
   return match ? match[0] : null;
 }
 
-export function buildDeliveryFileName(filePath: string): string {
-  return sanitizeFileName(path.basename(filePath));
+export function buildDeliveryFileName(filePath: string, title: string): string {
+  const extension = path.extname(filePath);
+  const fallbackBaseName = path.basename(filePath, extension);
+  const preferredBaseName = title.trim() || fallbackBaseName;
+  const normalizedBaseName = sanitizeFileName(preferredBaseName)
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[. ]+$/g, '');
+  const safeFallbackBaseName = sanitizeFileName(fallbackBaseName).trim() || 'video';
+  const safeBaseName = truncateFileNameBase(normalizedBaseName || safeFallbackBaseName);
+
+  return `${safeBaseName}${extension}`;
 }
 
 export function truncateCaption(title: string, maxLength = 900): string {
@@ -126,4 +136,12 @@ function formatDuration(totalSeconds: number): string {
   }
 
   return `${remainingSeconds}d`;
+}
+
+function truncateFileNameBase(fileName: string, maxLength = 120): string {
+  if (fileName.length <= maxLength) {
+    return fileName;
+  }
+
+  return fileName.slice(0, maxLength).trimEnd();
 }
