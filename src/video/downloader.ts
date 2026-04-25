@@ -3,6 +3,8 @@ import path from 'node:path';
 import { type DownloadFinishResult, type VideoProgress as YtDlpVideoProgress, YtDlp } from 'ytdlp-nodejs';
 import { type DownloadedVideo, type VideoDownloadProgress } from './utils.js';
 
+const BEST_AVAILABLE_VIDEO_FORMAT = 'bestvideo*+bestaudio/best';
+
 export type DownloadVideoOptions = {
   url: string;
   outputDir: string;
@@ -21,6 +23,7 @@ export class VideoDownloader {
   async download({ onProgress, outputDir, url }: DownloadVideoOptions): Promise<DownloadedVideo> {
     const outputTemplate = path.join(outputDir, 'download.%(ext)s');
     const download = this.ytdlp.download(url, {
+      format: BEST_AVAILABLE_VIDEO_FORMAT,
       jsRuntime: '',
       mergeOutputFormat: 'mp4',
       noPlaylist: true,
