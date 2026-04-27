@@ -8,7 +8,7 @@ Bot ini menerima URL dari user, mencoba mengunduh videonya dengan `yt-dlp`, lalu
 - download dengan `yt-dlp`
 - kirim kembali memakai `sendVideo` + `supports_streaming: true`
 - auto cleanup file sementara
-- pembatasan ukuran file
+- auto split video yang melebihi batas upload menjadi beberapa part
 - health check endpoint
 
 ## Struktur kode
@@ -30,8 +30,9 @@ Alur request tetap sama:
 3. Server menjalankan `yt-dlp`
 4. File disimpan sementara
 5. Bot membuat 5 screenshot dari durasi video
-6. Bot mengirim screenshot lalu video ke user
-7. File sementara dihapus
+6. Kalau video melebihi `MAX_FILE_SIZE_BYTES`, bot memecah video menjadi beberapa part dengan `ffmpeg`
+7. Bot mengirim screenshot lalu video ke user
+8. File sementara dihapus
 
 ## Penting
 Agar bot bisa mengirim file besar, sebaiknya gunakan **local/self-hosted Telegram Bot API** dan isi `TELEGRAM_API_ROOT`.
@@ -48,6 +49,8 @@ See: https://github.com/tdlib/telegram-bot-api
 
 ## Environment
 Salin `.env.example` menjadi `.env` lalu isi nilainya.
+
+`MAX_FILE_SIZE_BYTES` default-nya `2147483648` (2 GiB). Video yang lebih besar dari nilai ini akan dikirim sebagai beberapa part.
 
 ## Menjalankan lokal
 ```bash

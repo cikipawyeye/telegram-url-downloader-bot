@@ -9,6 +9,7 @@ import { registerBotHandlers } from './telegram/register-handlers.js';
 import { VideoDownloader } from './video/downloader.js';
 import { VideoMessageProcessor } from './video/process-message.js';
 import { VideoScreenshotGenerator } from './video/screenshots.js';
+import { VideoSplitter } from './video/splitter.js';
 
 const config = loadConfig();
 
@@ -34,6 +35,9 @@ async function bootstrap(): Promise<void> {
     }),
     videoScreenshotGenerator: new VideoScreenshotGenerator({
       commandTimeoutMs: Math.min(config.downloadTimeoutMs, 120_000),
+    }),
+    videoSplitter: new VideoSplitter({
+      commandTimeoutMs: config.downloadTimeoutMs,
     }),
     workspaceManager,
     screenshotCount: config.screenshotCount,

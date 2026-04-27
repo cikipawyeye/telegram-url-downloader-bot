@@ -45,6 +45,23 @@ export function buildDeliveryFileName(filePath: string, title: string): string {
   return `${safeBaseName}${extension}`;
 }
 
+export function buildDeliveryPartFileName(filePath: string, title: string, index: number, total: number): string {
+  const deliveryFileName = buildDeliveryFileName(filePath, title);
+  const extension = path.extname(deliveryFileName);
+  const baseName = path.basename(deliveryFileName, extension);
+  const partLabel = `part-${String(index).padStart(String(total).length, '0')}-of-${total}`;
+
+  return `${baseName}.${partLabel}${extension}`;
+}
+
+export function buildPartCaption(title: string, index: number, total: number): string {
+  if (total <= 1) {
+    return truncateCaption(title);
+  }
+
+  return truncateCaption(`${title}\nPart ${index}/${total}`);
+}
+
 export function truncateCaption(title: string, maxLength = 900): string {
   if (title.length <= maxLength) {
     return title;
