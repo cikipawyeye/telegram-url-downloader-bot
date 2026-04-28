@@ -80,25 +80,31 @@ export class VideoMessageProcessor {
         `Download selesai. Sedang membuat ${this.screenshotCount} screenshot video...`,
       );
 
-      const screenshots = await this.videoScreenshotGenerator.generate({
-        videoPath: video.filePath,
+      const screenshots = await this.tryGenerateScreenshots({
+        acceptedMessage,
+        notifier,
         outputDir,
-        durationSeconds: video.durationSeconds,
-        count: this.screenshotCount,
+        video,
       });
 
+      if (screenshots.length > 0) {
+        await notifier.updateStatus(
+          acceptedMessage,
+          'Screenshot selesai. Sedang mengirim screenshot ke Telegram...',
+        );
+
+        await notifier.sendScreenshots(screenshots);
+      }
+
       await notifier.updateStatus(
         acceptedMessage,
-        'Screenshot selesai. Sedang mengirim screenshot ke Telegram...',
-      );
-
-      await notifier.sendScreenshots(screenshots);
-
-      await notifier.updateStatus(
-        acceptedMessage,
-        video.fileSize > this.maxFileSizeBytes
+        screenshots.length > 0 && video.fileSize > this.maxFileSizeBytes
           ? `Screenshot terkirim. Video lebih dari ${formatBytes(this.maxFileSizeBytes)}, sedang memecah video...`
-          : 'Screenshot terkirim. Sedang mengirim video ke Telegram...',
+          : video.fileSize > this.maxFileSizeBytes
+            ? `Video lebih dari ${formatBytes(this.maxFileSizeBytes)}, sedang memecah video...`
+            : screenshots.length > 0
+              ? 'Screenshot terkirim. Sedang mengirim video ke Telegram...'
+              : 'Sedang mengirim video ke Telegram...',
       );
 
       const segments = await this.videoSplitter.split(video, outputDir, this.maxFileSizeBytes);
@@ -139,6 +145,31 @@ export class VideoMessageProcessor {
       await notifier.updateStatus(acceptedMessage, `Gagal memproses link.\n${message}`);
     } finally {
       await this.workspaceManager.remove({ dirPath: outputDir });
+    }
+  }
+
+  private async tryGenerateScreenshots(options: {
+    acceptedMessage: StatusMessage;
+    notifier: TelegramNotifier;
+    outputDir: string;
+    video: Awaited<ReturnType<VideoDownloader['download']>>;
+  }) {
+    try {
+      return await this.videoScreenshotGenerator.generate({
+        videoPath: options.video.filePath,
+        outputDir: options.outputDir,
+        durationSeconds: options.video.durationSeconds,
+        count: this.screenshotCount,
+      });
+    } catch (error) {
+      console.error('Failed to generate screenshots:', error);
+
+      await options.notifier.updateStatus(
+        options.acceptedMessage,
+        'Screenshot gagal dibuat. Video tetap akan dikirim...',
+      );
+
+      return [];
     }
   }
 
