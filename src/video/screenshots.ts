@@ -36,23 +36,16 @@ export class VideoScreenshotGenerator {
 
     for (const item of screenshotPlan) {
       const filePath = path.join(screenshotsDir, item.fileName);
-
-      await this.runCommand('ffmpeg', [
-        '-y',
-        '-loglevel',
-        'error',
-        '-ss',
-        item.captureSeconds.toFixed(3),
-        '-i',
-        videoPath,
-        '-frames:v',
-        '1',
-        '-q:v',
-        '2',
+      const captured = await this.captureScreenshot({
+        durationSeconds: resolvedDurationSeconds,
         filePath,
-      ]);
+        preferredCaptureSeconds: item.captureSeconds,
+        videoPath,
+      });
 
-      await fsp.access(filePath);
+      if (!captured) {
+        throw new Error(`Gagal membuat screenshot ${item.fileName}: frame video tidak ditemukan.`);
+      }
 
       screenshots.push({
         filePath,
@@ -61,6 +54,62 @@ export class VideoScreenshotGenerator {
     }
 
     return screenshots;
+  }
+
+  private async captureScreenshot(options: {
+    durationSeconds: number;
+    filePath: string;
+    preferredCaptureSeconds: number;
+    videoPath: string;
+  }): Promise<boolean> {
+    const captureTimes = this.buildCaptureFallbacks(
+      options.preferredCaptureSeconds,
+      options.durationSeconds,
+    );
+
+    for (const captureSeconds of captureTimes) {
+      await fsp.rm(options.filePath, { force: true });
+
+      await this.runCommand('ffmpeg', [
+        '-y',
+        '-loglevel',
+        'error',
+        '-ss',
+        captureSeconds.toFixed(3),
+        '-i',
+        options.videoPath,
+        '-frames:v',
+        '1',
+        '-q:v',
+        '2',
+        options.filePath,
+      ]);
+
+      if (await fileExistsWithContent(options.filePath)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private buildCaptureFallbacks(preferredCaptureSeconds: number, durationSeconds: number): number[] {
+    const maxCaptureSeconds = Math.max(0, durationSeconds - Math.min(1, durationSeconds / 20));
+    const candidates = [
+      preferredCaptureSeconds,
+      preferredCaptureSeconds - 1,
+      durationSeconds * 0.75,
+      durationSeconds * 0.5,
+      durationSeconds * 0.25,
+      Math.min(1, maxCaptureSeconds),
+      0,
+    ];
+
+    return Array.from(new Set(
+      candidates
+        .map((seconds) => Math.min(maxCaptureSeconds, Math.max(0, seconds)))
+        .map((seconds) => seconds.toFixed(3)),
+    )).map(Number);
   }
 
   private async probeDuration(videoPath: string): Promise<number> {
@@ -91,8 +140,14 @@ export class VideoScreenshotGenerator {
 
       let stdout = '';
       let stderr = '';
+      let settled = false;
 
       const timer = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
         child.kill('SIGKILL');
         reject(new Error(`${command} timeout setelah ${Math.round(this.commandTimeoutMs / 1000)} detik.`));
       }, this.commandTimeoutMs);
@@ -106,11 +161,21 @@ export class VideoScreenshotGenerator {
       });
 
       child.on('error', (error) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
         clearTimeout(timer);
         reject(error);
       });
 
       child.on('close', (code) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
         clearTimeout(timer);
 
         if (code === 0) {
@@ -123,4 +188,21 @@ export class VideoScreenshotGenerator {
       });
     });
   }
+}
+
+async function fileExistsWithContent(filePath: string): Promise<boolean> {
+  try {
+    const stat = await fsp.stat(filePath);
+    return stat.size > 0;
+  } catch (error) {
+    if (isNotFoundError(error)) {
+      return false;
+    }
+
+    throw error;
+  }
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return error instanceof Error && 'code' in error && error.code === 'ENOENT';
 }
