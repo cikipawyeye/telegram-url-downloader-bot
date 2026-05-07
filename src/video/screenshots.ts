@@ -1,13 +1,24 @@
 import { spawn } from 'node:child_process';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { buildScreenshotPlan, type VideoScreenshot } from './utils.js';
+import { buildScreenshotPlan, type VideoScreenshot, type VideoThumbnail } from './utils.js';
+
+const TELEGRAM_THUMBNAIL_FILE_NAME = 'thumbnail.jpg';
+const TELEGRAM_THUMBNAIL_MAX_BYTES = 200 * 1024;
+const TELEGRAM_THUMBNAIL_MAX_DIMENSION = 320;
+const TELEGRAM_THUMBNAIL_QUALITY_VALUES = [4, 8, 12, 16, 20, 24, 28, 31];
 
 export type GenerateScreenshotsOptions = {
   videoPath: string;
   outputDir: string;
   durationSeconds?: number;
   count: number;
+};
+
+export type GenerateThumbnailOptions = {
+  videoPath: string;
+  outputDir: string;
+  durationSeconds?: number;
 };
 
 export class VideoScreenshotGenerator {
@@ -56,6 +67,34 @@ export class VideoScreenshotGenerator {
     return screenshots;
   }
 
+  async generateThumbnail({
+    durationSeconds,
+    outputDir,
+    videoPath,
+  }: GenerateThumbnailOptions): Promise<VideoThumbnail> {
+    const filePath = path.join(outputDir, TELEGRAM_THUMBNAIL_FILE_NAME);
+    const resolvedDurationSeconds =
+      durationSeconds !== undefined && durationSeconds > 0
+        ? durationSeconds
+        : await this.probeDuration(videoPath);
+
+    const captured = await this.captureThumbnail({
+      durationSeconds: resolvedDurationSeconds,
+      filePath,
+      preferredCaptureSeconds: resolvedDurationSeconds * 0.5,
+      videoPath,
+    });
+
+    if (!captured) {
+      throw new Error('Gagal membuat thumbnail: frame video tidak ditemukan atau file lebih dari 200 KB.');
+    }
+
+    return {
+      filePath,
+      fileName: TELEGRAM_THUMBNAIL_FILE_NAME,
+    };
+  }
+
   private async captureScreenshot(options: {
     durationSeconds: number;
     filePath: string;
@@ -90,6 +129,48 @@ export class VideoScreenshotGenerator {
       }
     }
 
+    return false;
+  }
+
+  private async captureThumbnail(options: {
+    durationSeconds: number;
+    filePath: string;
+    preferredCaptureSeconds: number;
+    videoPath: string;
+  }): Promise<boolean> {
+    const captureTimes = this.buildCaptureFallbacks(
+      options.preferredCaptureSeconds,
+      options.durationSeconds,
+    );
+
+    for (const captureSeconds of captureTimes) {
+      for (const quality of TELEGRAM_THUMBNAIL_QUALITY_VALUES) {
+        await fsp.rm(options.filePath, { force: true });
+
+        await this.runCommand('ffmpeg', [
+          '-y',
+          '-loglevel',
+          'error',
+          '-ss',
+          captureSeconds.toFixed(3),
+          '-i',
+          options.videoPath,
+          '-frames:v',
+          '1',
+          '-vf',
+          `scale=${TELEGRAM_THUMBNAIL_MAX_DIMENSION}:${TELEGRAM_THUMBNAIL_MAX_DIMENSION}:force_original_aspect_ratio=decrease`,
+          '-q:v',
+          String(quality),
+          options.filePath,
+        ]);
+
+        if (await fileExistsWithContent(options.filePath, TELEGRAM_THUMBNAIL_MAX_BYTES)) {
+          return true;
+        }
+      }
+    }
+
+    await fsp.rm(options.filePath, { force: true });
     return false;
   }
 
@@ -190,10 +271,10 @@ export class VideoScreenshotGenerator {
   }
 }
 
-async function fileExistsWithContent(filePath: string): Promise<boolean> {
+async function fileExistsWithContent(filePath: string, maxBytes?: number): Promise<boolean> {
   try {
     const stat = await fsp.stat(filePath);
-    return stat.size > 0;
+    return stat.size > 0 && (maxBytes === undefined || stat.size < maxBytes);
   } catch (error) {
     if (isNotFoundError(error)) {
       return false;

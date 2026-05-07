@@ -1,7 +1,7 @@
 import type { DownloadWorkspace, WorkspaceManager } from '../storage/workspace.js';
 import type { StatusMessage } from '../telegram/notifier.js';
 import type { TelegramNotifier } from '../telegram/notifier.js';
-import { buildDeliveryFileName, buildDeliveryPartFileName, buildPartCaption, extractFirstUrl, formatBytes, formatDownloadProgress, truncateCaption, type VideoDownloadProgress } from './utils.js';
+import { buildDeliveryFileName, buildDeliveryPartFileName, buildPartCaption, extractFirstUrl, formatBytes, formatDownloadProgress, truncateCaption, type VideoDownloadProgress, type VideoThumbnail } from './utils.js';
 import type { VideoDownloader } from './downloader.js';
 import type { VideoScreenshotGenerator } from './screenshots.js';
 import type { VideoSplitter } from './splitter.js';
@@ -98,6 +98,20 @@ export class VideoMessageProcessor {
 
       await notifier.updateStatus(
         acceptedMessage,
+        screenshots.length > 0
+          ? 'Screenshot terkirim. Sedang membuat thumbnail video...'
+          : 'Sedang membuat thumbnail video...',
+      );
+
+      const thumbnail = await this.tryGenerateThumbnail({
+        acceptedMessage,
+        notifier,
+        outputDir,
+        video,
+      });
+
+      await notifier.updateStatus(
+        acceptedMessage,
         screenshots.length > 0 && video.fileSize > this.maxFileSizeBytes
           ? `Screenshot terkirim. Video lebih dari ${formatBytes(this.maxFileSizeBytes)}, sedang memecah video...`
           : video.fileSize > this.maxFileSizeBytes
@@ -132,6 +146,7 @@ export class VideoMessageProcessor {
           caption: segments.length > 1
             ? buildPartCaption(video.title, segment.index, segment.total)
             : truncateCaption(video.title),
+          thumbnail,
         });
       }
 
@@ -170,6 +185,30 @@ export class VideoMessageProcessor {
       );
 
       return [];
+    }
+  }
+
+  private async tryGenerateThumbnail(options: {
+    acceptedMessage: StatusMessage;
+    notifier: TelegramNotifier;
+    outputDir: string;
+    video: Awaited<ReturnType<VideoDownloader['download']>>;
+  }): Promise<VideoThumbnail | undefined> {
+    try {
+      return await this.videoScreenshotGenerator.generateThumbnail({
+        videoPath: options.video.filePath,
+        outputDir: options.outputDir,
+        durationSeconds: options.video.durationSeconds,
+      });
+    } catch (error) {
+      console.error('Failed to generate thumbnail:', error);
+
+      await options.notifier.updateStatus(
+        options.acceptedMessage,
+        'Thumbnail gagal dibuat. Video tetap akan dikirim...',
+      );
+
+      return undefined;
     }
   }
 

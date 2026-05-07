@@ -1,5 +1,5 @@
 import { InputFile, type Bot, type Context } from 'grammy';
-import type { VideoScreenshot } from '../video/utils.js';
+import type { VideoScreenshot, VideoThumbnail } from '../video/utils.js';
 
 export type StatusMessage = {
   messageId: number;
@@ -9,6 +9,7 @@ export type OutboundVideo = {
   filePath: string;
   fileName: string;
   caption: string;
+  thumbnail?: VideoThumbnail;
 };
 
 export class TelegramNotifier {
@@ -86,6 +87,9 @@ export class TelegramNotifier {
       {
         supports_streaming: true,
         caption: video.caption,
+        thumbnail: video.thumbnail
+          ? new InputFile(video.thumbnail.filePath, video.thumbnail.fileName)
+          : undefined,
       },
     );
   }

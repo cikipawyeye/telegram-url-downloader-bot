@@ -21,6 +21,11 @@ export type VideoScreenshot = {
   fileName: string;
 };
 
+export type VideoThumbnail = {
+  filePath: string;
+  fileName: string;
+};
+
 type ScreenshotPlanItem = {
   fileName: string;
   captureSeconds: number;
