@@ -147,6 +147,8 @@ export class VideoMessageProcessor {
             ? buildPartCaption(video.title, segment.index, segment.total)
             : truncateCaption(video.title),
           thumbnail,
+          width: video.width,
+          height: video.height,
         });
       }
 

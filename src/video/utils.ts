@@ -5,6 +5,8 @@ export type DownloadedVideo = {
   fileSize: number;
   title: string;
   durationSeconds?: number;
+  width?: number;
+  height?: number;
 };
 
 export type VideoDownloadProgress = {

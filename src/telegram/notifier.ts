@@ -10,6 +10,8 @@ export type OutboundVideo = {
   fileName: string;
   caption: string;
   thumbnail?: VideoThumbnail;
+  width?: number;
+  height?: number;
 };
 
 export class TelegramNotifier {
@@ -87,6 +89,8 @@ export class TelegramNotifier {
       {
         supports_streaming: true,
         caption: video.caption,
+        width: video.width,
+        height: video.height,
         thumbnail: video.thumbnail
           ? new InputFile(video.thumbnail.filePath, video.thumbnail.fileName)
           : undefined,
