@@ -65,6 +65,45 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+## Cloudflare WARP proxy dengan systemd
+Proxy dapat diterapkan hanya ke trafik `yt-dlp`, sehingga webhook dan koneksi Telegram tidak ikut melewati WARP.
+
+Ubah WARP ke mode SOCKS5 lokal dan pilih portnya:
+
+```bash
+sudo warp-cli proxy port 40000
+sudo warp-cli mode proxy
+sudo warp-cli connect
+warp-cli status
+```
+
+Isi environment aplikasi yang dibaca unit systemd:
+
+```dotenv
+YTDLP_PROXY=socks5://127.0.0.1:40000
+```
+
+Pastikan unit aplikasi dimulai setelah daemon WARP dan menggunakan file environment tersebut:
+
+```ini
+[Unit]
+After=network-online.target warp-svc.service
+Wants=network-online.target
+Requires=warp-svc.service
+
+[Service]
+EnvironmentFile=/path/to/telegram-video-downloader-bot/.env
+```
+
+Setelah mengubah unit atau environment, muat ulang dan restart aplikasi:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart nama-service-aplikasi.service
+```
+
+`socks5://` membuat resolusi DNS dilakukan oleh host. Jika ingin resolusi DNS juga melalui proxy dan versi `yt-dlp` yang terpasang mendukungnya, gunakan `socks5h://127.0.0.1:40000`.
+
 ## Reverse proxy
 Arahkan domain HTTPS kamu ke port aplikasi, lalu set:
 - `PUBLIC_BASE_URL=https://bot.domainkamu.com`

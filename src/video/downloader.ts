@@ -31,10 +31,12 @@ type FfprobeMetadataOutput = {
 
 export class VideoDownloader {
   private readonly downloadTimeoutMs: number;
+  private readonly proxy?: string;
   private readonly ytdlp: YtDlp;
 
-  constructor(options: { downloadTimeoutMs: number; ytdlp: YtDlp }) {
+  constructor(options: { downloadTimeoutMs: number; proxy?: string; ytdlp: YtDlp }) {
     this.downloadTimeoutMs = options.downloadTimeoutMs;
+    this.proxy = options.proxy;
     this.ytdlp = options.ytdlp;
   }
 
@@ -47,6 +49,7 @@ export class VideoDownloader {
       noPlaylist: true,
       output: outputTemplate,
       progressDelta: 2,
+      proxy: this.proxy,
     });
 
     if (onProgress) {

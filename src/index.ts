@@ -31,6 +31,7 @@ async function bootstrap(): Promise<void> {
     maxFileSizeBytes: config.maxFileSizeBytes,
     videoDownloader: new VideoDownloader({
       downloadTimeoutMs: config.downloadTimeoutMs,
+      proxy: config.ytdlpProxy,
       ytdlp: new YtDlp(),
     }),
     videoScreenshotGenerator: new VideoScreenshotGenerator({
