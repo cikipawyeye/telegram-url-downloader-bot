@@ -9,6 +9,7 @@ export type AppConfig = {
   downloadTimeoutMs: number;
   ytdlpProxy?: string;
   screenshotCount: number;
+  sendVideoInAlbum: boolean;
 };
 
 export function loadConfig(): AppConfig {
@@ -39,5 +40,6 @@ export function loadConfig(): AppConfig {
     downloadTimeoutMs: Number(process.env.DOWNLOAD_TIMEOUT_MS ?? 900000),
     ytdlpProxy: process.env.YTDLP_PROXY || undefined,
     screenshotCount: Number(process.env.SCREENSHOT_COUNT ?? 5),
+    sendVideoInAlbum: process.env.SEND_VIDEO_IN_ALBUM !== 'false',
   };
 }

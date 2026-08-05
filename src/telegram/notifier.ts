@@ -14,6 +14,8 @@ export type OutboundVideo = {
   height?: number;
 };
 
+const MEDIA_GROUP_MAX_ITEMS = 10;
+
 export class TelegramNotifier {
   private readonly bot: Bot<Context>;
   private readonly ctx: Context;
@@ -80,6 +82,39 @@ export class TelegramNotifier {
     }));
 
     await this.bot.api.sendMediaGroup(this.getChatId(), media);
+  }
+
+  async sendVideoWithScreenshots(screenshots: VideoScreenshot[], video: OutboundVideo): Promise<void> {
+    const media: Array<
+      | { type: 'photo'; media: InputFile }
+      | {
+          type: 'video';
+          media: InputFile;
+          caption: string;
+          width?: number;
+          height?: number;
+          supports_streaming: boolean;
+        }
+    > = [
+      {
+        type: 'video',
+        media: new InputFile(video.filePath, video.fileName),
+        caption: video.caption,
+        width: video.width,
+        height: video.height,
+        supports_streaming: true,
+      },
+      ...screenshots.map((screenshot) => ({
+        type: 'photo' as const,
+        media: new InputFile(screenshot.filePath, screenshot.fileName),
+      })),
+    ];
+
+    await this.bot.api.sendMediaGroup(this.getChatId(), media);
+  }
+
+  canCombineScreenshotsWithVideo(screenshotsCount: number): boolean {
+    return screenshotsCount > 0 && screenshotsCount + 1 <= MEDIA_GROUP_MAX_ITEMS;
   }
 
   async sendVideo(video: OutboundVideo): Promise<void> {

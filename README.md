@@ -9,6 +9,7 @@ Bot ini menerima URL dari user, mencoba mengunduh videonya dengan `yt-dlp`, lalu
 - kirim kembali memakai `sendVideo` + `supports_streaming: true`
 - auto cleanup file sementara
 - auto split video yang melebihi batas upload menjadi beberapa part
+- screenshot + video dikirim dalam satu album/media group (bisa dimatikan dengan `SEND_VIDEO_IN_ALBUM=false`)
 - health check endpoint
 
 ## Struktur kode
@@ -33,6 +34,13 @@ Alur request tetap sama:
 6. Kalau video melebihi `MAX_FILE_SIZE_BYTES`, bot memecah video menjadi beberapa part dengan `ffmpeg`
 7. Bot mengirim screenshot lalu video ke user
 8. File sementara dihapus
+
+### Satu album (screenshot + video)
+Secara default bot mengirim screenshot beserta video dalam **satu album/media group** (video diletakkan paling depan agar judulnya tampil sebagai caption album). Catatan:
+- Video dalam album dikompres/diturunkan kualitasnya oleh Telegram dibanding `sendVideo` biasa (yang bisa di-stream dalam kualitas penuh).
+- Batas media group adalah **maksimal 10 item** dan **hanya caption item pertama** yang ditampilkan.
+- Kalau video terpecah jadi beberapa part, atau jumlah item melebihi 10, bot otomatis fallback ke pengiriman terpisah (screenshot sendiri, video sendiri).
+- Untuk tetap mengirim video full-quality streamable, set `SEND_VIDEO_IN_ALBUM=false`.
 
 ## Penting
 Agar bot bisa mengirim file besar, sebaiknya gunakan **local/self-hosted Telegram Bot API** dan isi `TELEGRAM_API_ROOT`.

@@ -19,6 +19,7 @@ export class VideoMessageProcessor {
   private readonly videoSplitter: VideoSplitter;
   private readonly workspaceManager: WorkspaceManager;
   private readonly screenshotCount: number;
+  private readonly sendVideoInAlbum: boolean;
 
   constructor(options: {
     maxFileSizeBytes: number;
@@ -27,6 +28,7 @@ export class VideoMessageProcessor {
     videoSplitter: VideoSplitter;
     workspaceManager: WorkspaceManager;
     screenshotCount: number;
+    sendVideoInAlbum: boolean;
   }) {
     this.maxFileSizeBytes = options.maxFileSizeBytes;
     this.videoDownloader = options.videoDownloader;
@@ -34,6 +36,7 @@ export class VideoMessageProcessor {
     this.videoSplitter = options.videoSplitter;
     this.workspaceManager = options.workspaceManager;
     this.screenshotCount = options.screenshotCount;
+    this.sendVideoInAlbum = options.sendVideoInAlbum;
   }
 
   async process({ notifier, text, userId }: ProcessVideoMessageRequest): Promise<void> {
@@ -87,19 +90,10 @@ export class VideoMessageProcessor {
         video,
       });
 
-      if (screenshots.length > 0) {
-        await notifier.updateStatus(
-          acceptedMessage,
-          'Screenshot selesai. Sedang mengirim screenshot ke Telegram...',
-        );
-
-        await notifier.sendScreenshots(screenshots);
-      }
-
       await notifier.updateStatus(
         acceptedMessage,
         screenshots.length > 0
-          ? 'Screenshot terkirim. Sedang membuat thumbnail video...'
+          ? 'Screenshot selesai. Sedang membuat thumbnail video...'
           : 'Sedang membuat thumbnail video...',
       );
 
@@ -112,44 +106,73 @@ export class VideoMessageProcessor {
 
       await notifier.updateStatus(
         acceptedMessage,
-        screenshots.length > 0 && video.fileSize > this.maxFileSizeBytes
-          ? `Screenshot terkirim. Video lebih dari ${formatBytes(this.maxFileSizeBytes)}, sedang memecah video...`
-          : video.fileSize > this.maxFileSizeBytes
-            ? `Video lebih dari ${formatBytes(this.maxFileSizeBytes)}, sedang memecah video...`
-            : screenshots.length > 0
-              ? 'Screenshot terkirim. Sedang mengirim video ke Telegram...'
-              : 'Sedang mengirim video ke Telegram...',
+        video.fileSize > this.maxFileSizeBytes
+          ? `Video lebih dari ${formatBytes(this.maxFileSizeBytes)}, sedang memecah video...`
+          : screenshots.length > 0
+            ? 'Screenshot selesai. Sedang mengirim video ke Telegram...'
+            : 'Sedang mengirim video ke Telegram...',
       );
 
       const segments = await this.videoSplitter.split(video, outputDir, this.maxFileSizeBytes);
 
-      if (segments.length > 1) {
+      const shouldCombine =
+        this.sendVideoInAlbum &&
+        notifier.canCombineScreenshotsWithVideo(screenshots.length) &&
+        segments.length === 1;
+
+      if (shouldCombine) {
+        const segment = segments[0];
+
         await notifier.updateStatus(
           acceptedMessage,
-          `Video berhasil dipecah menjadi ${segments.length} part. Sedang mengirim ke Telegram...`,
-        );
-      }
-
-      for (const segment of segments) {
-        await notifier.updateStatus(
-          acceptedMessage,
-          segments.length > 1
-            ? `Sedang mengirim video part ${segment.index}/${segment.total} ke Telegram...`
-            : 'Sedang mengirim video ke Telegram...',
+          'Screenshot & video siap. Sedang mengirim ke Telegram dalam satu album...',
         );
 
-        await notifier.sendVideo({
+        await notifier.sendVideoWithScreenshots(screenshots, {
           filePath: segment.filePath,
-          fileName: segments.length > 1
-            ? buildDeliveryPartFileName(segment.filePath, video.title, segment.index, segment.total)
-            : buildDeliveryFileName(segment.filePath, video.title),
-          caption: segments.length > 1
-            ? buildPartCaption(video.title, segment.index, segment.total)
-            : truncateCaption(video.title),
-          thumbnail,
+          fileName: buildDeliveryFileName(segment.filePath, video.title),
+          caption: truncateCaption(video.title),
           width: video.width,
           height: video.height,
         });
+      } else {
+        if (screenshots.length > 0) {
+          await notifier.updateStatus(
+            acceptedMessage,
+            'Screenshot selesai. Sedang mengirim screenshot ke Telegram...',
+          );
+
+          await notifier.sendScreenshots(screenshots);
+        }
+
+        if (segments.length > 1) {
+          await notifier.updateStatus(
+            acceptedMessage,
+            `Video berhasil dipecah menjadi ${segments.length} part. Sedang mengirim ke Telegram...`,
+          );
+        }
+
+        for (const segment of segments) {
+          await notifier.updateStatus(
+            acceptedMessage,
+            segments.length > 1
+              ? `Sedang mengirim video part ${segment.index}/${segment.total} ke Telegram...`
+              : 'Sedang mengirim video ke Telegram...',
+          );
+
+          await notifier.sendVideo({
+            filePath: segment.filePath,
+            fileName: segments.length > 1
+              ? buildDeliveryPartFileName(segment.filePath, video.title, segment.index, segment.total)
+              : buildDeliveryFileName(segment.filePath, video.title),
+            caption: segments.length > 1
+              ? buildPartCaption(video.title, segment.index, segment.total)
+              : truncateCaption(video.title),
+            thumbnail,
+            width: video.width,
+            height: video.height,
+          });
+        }
       }
 
       try {

@@ -42,6 +42,7 @@ async function bootstrap(): Promise<void> {
     }),
     workspaceManager,
     screenshotCount: config.screenshotCount,
+    sendVideoInAlbum: config.sendVideoInAlbum,
   });
 
   registerBotHandlers(bot, videoMessageProcessor);
