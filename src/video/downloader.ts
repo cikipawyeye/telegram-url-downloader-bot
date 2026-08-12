@@ -4,7 +4,11 @@ import path from 'node:path';
 import { type DownloadFinishResult, type VideoProgress as YtDlpVideoProgress, YtDlp } from 'ytdlp-nodejs';
 import { type DownloadedVideo, type VideoDownloadProgress } from './utils.js';
 
-const BEST_AVAILABLE_VIDEO_FORMAT = 'bestvideo*+bestaudio/best';
+// Pick a single progressive file that already contains both audio and video.
+// This avoids yt-dlp downloading separate video+audio streams and then merging
+// them (which could need 3-4x the final size on disk). All fallbacks below
+// select ONE file, so no `+` selector is used and no merge ever happens.
+const SINGLE_FILE_VIDEO_FORMAT = 'best[ext=mp4][vcodec^=avc1][acodec^=mp4a]/best[ext=mp4]/best';
 const METADATA_PROBE_TIMEOUT_MS = 30_000;
 
 export type DownloadVideoOptions = {
@@ -43,7 +47,7 @@ export class VideoDownloader {
   async download({ onProgress, outputDir, url }: DownloadVideoOptions): Promise<DownloadedVideo> {
     const outputTemplate = path.join(outputDir, 'download.%(ext)s');
     const download = this.ytdlp.download(url, {
-      format: BEST_AVAILABLE_VIDEO_FORMAT,
+      format: SINGLE_FILE_VIDEO_FORMAT,
       jsRuntime: '',
       mergeOutputFormat: 'mp4',
       noPlaylist: true,

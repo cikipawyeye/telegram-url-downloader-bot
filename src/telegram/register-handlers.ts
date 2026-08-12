@@ -46,9 +46,14 @@ function buildPendingKeyboard(): InlineKeyboard {
     .text('❌ Batal', 'convert:cancel');
 }
 
-// In-memory pending conversion resolution per chat. The chosen resolution is
-// consumed by the next text message that contains a URL.
-const pendingConversions = new Map<number, number>();
+type PendingConversion = {
+  height: number;
+  messageId: number;
+};
+
+// In-memory pending conversion per chat, along with the id of the instruction
+// message so its inline buttons can be removed once a URL is sent.
+const pendingConversions = new Map<number, PendingConversion>();
 
 export function registerBotHandlers(
   bot: Bot<Context>,
@@ -85,9 +90,10 @@ export function registerBotHandlers(
     if (resolutionMatch) {
       const height = Number(resolutionMatch[1]);
       const chatId = ctx.chat?.id;
+      const messageId = ctx.callbackQuery.message?.message_id;
 
-      if (chatId !== undefined) {
-        pendingConversions.set(chatId, height);
+      if (chatId !== undefined && messageId !== undefined) {
+        pendingConversions.set(chatId, { height, messageId });
       }
 
       await ctx.answerCallbackQuery();
@@ -135,19 +141,31 @@ export function registerBotHandlers(
 
   bot.on('message:text', async (ctx) => {
     const chatId = ctx.chat?.id;
-    const pendingHeight = chatId !== undefined ? pendingConversions.get(chatId) : undefined;
+    const pending = chatId !== undefined ? pendingConversions.get(chatId) : undefined;
     const hasUrl = URL_PATTERN.test(ctx.message.text);
+
+    if (pending && hasUrl && chatId !== undefined) {
+      // Consume the pending conversion and remove the instruction message's
+      // inline buttons ("Batal" / "Pilih resolusi lain").
+      pendingConversions.delete(chatId);
+
+      try {
+        await ctx.api.editMessageText(
+          chatId,
+          pending.messageId,
+          `✓ Resolusi ${pending.height}p diaktifkan untuk pengunduhan ini.`,
+        );
+      } catch (error) {
+        console.error('Failed to clear convert instruction buttons:', error);
+      }
+    }
 
     await videoMessageProcessor.process({
       notifier: new TelegramNotifier(ctx, bot),
       text: ctx.message.text,
       userId: String(ctx.from?.id ?? 'unknown'),
-      convertToHeight: pendingHeight,
+      convertToHeight: pending?.height,
     });
-
-    if (hasUrl && chatId !== undefined) {
-      pendingConversions.delete(chatId);
-    }
   });
 
   bot.catch(async (error) => {
