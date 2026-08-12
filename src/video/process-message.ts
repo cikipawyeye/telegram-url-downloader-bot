@@ -6,6 +6,8 @@ import type { VideoDownloader } from './downloader.js';
 import type { VideoScreenshotGenerator } from './screenshots.js';
 import type { VideoSplitter } from './splitter.js';
 
+const MIN_FREE_SPACE_BYTES = 1024 * 1024 * 1024; // 1 GiB
+
 export type ProcessVideoMessageRequest = {
   notifier: TelegramNotifier;
   text: string;
@@ -44,6 +46,13 @@ export class VideoMessageProcessor {
 
     if (!url) {
       await notifier.sendInvalidUrl();
+      return;
+    }
+
+    const freeSpaceBytes = await this.workspaceManager.getFreeSpaceBytes();
+
+    if (freeSpaceBytes < MIN_FREE_SPACE_BYTES) {
+      await notifier.sendStorageLow();
       return;
     }
 

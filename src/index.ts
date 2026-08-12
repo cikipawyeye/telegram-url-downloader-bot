@@ -26,6 +26,7 @@ async function bootstrap(): Promise<void> {
 
   const workspaceManager = new WorkspaceManager(config.downloadDir);
   await workspaceManager.prepareRoot();
+  workspaceManager.startAutoSweep();
 
   const videoMessageProcessor = new VideoMessageProcessor({
     maxFileSizeBytes: config.maxFileSizeBytes,
