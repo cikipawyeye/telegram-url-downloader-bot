@@ -23,6 +23,29 @@ const HELP_TEXT = [
 
 const URL_PATTERN = /https?:\/\/\S+/i;
 
+const RESOLUTION_MENU_TEXT = [
+  'Pilih resolusi video yang diinginkan.',
+  '',
+  'Setelah memilih, kirimkan link video yang ingin diunduh lalu dikonversi ke resolusi tersebut.',
+  'Video akan dikonversi agar ukurannya lebih kecil dan kompatibel untuk streaming langsung di Telegram.',
+].join('\n');
+
+function buildResolutionKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text('1080p', 'convert:1080')
+    .text('720p', 'convert:720')
+    .row()
+    .text('480p', 'convert:480')
+    .text('240p', 'convert:240');
+}
+
+function buildPendingKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text('Pilih resolusi lain', 'convert:select')
+    .row()
+    .text('Batal', 'convert:cancel');
+}
+
 // In-memory pending conversion resolution per chat. The chosen resolution is
 // consumed by the next text message that contains a URL.
 const pendingConversions = new Map<number, number>();
@@ -50,43 +73,64 @@ export function registerBotHandlers(
   });
 
   bot.command('convert', async (ctx) => {
-    const keyboard = new InlineKeyboard()
-      .text('1080p', 'convert:1080')
-      .text('720p', 'convert:720')
-      .row()
-      .text('480p', 'convert:480')
-      .text('240p', 'convert:240');
-
-    await ctx.reply(
-      [
-        'Pilih resolusi video yang diinginkan.',
-        '',
-        'Setelah memilih, kirimkan link video yang ingin diunduh lalu dikonversi ke resolusi tersebut.',
-        'Video akan dikonversi agar ukurannya lebih kecil dan kompatibel untuk streaming langsung di Telegram.',
-      ].join('\n'),
-      { reply_markup: keyboard },
-    );
+    await ctx.reply(RESOLUTION_MENU_TEXT, {
+      reply_markup: buildResolutionKeyboard(),
+    });
   });
 
   bot.on('callback_query:data', async (ctx) => {
-    const match = ctx.callbackQuery.data.match(/^convert:(\d+)$/);
+    const data = ctx.callbackQuery.data;
+    const resolutionMatch = data.match(/^convert:(\d+)$/);
 
-    if (!match) {
+    if (resolutionMatch) {
+      const height = Number(resolutionMatch[1]);
+      const chatId = ctx.chat?.id;
+
+      if (chatId !== undefined) {
+        pendingConversions.set(chatId, height);
+      }
+
       await ctx.answerCallbackQuery();
+      await ctx.editMessageText(
+        [
+          `Siap! Resolusi ${height}p terpilih.`,
+          '',
+          `Kirimkan link video yang ingin dikonversi ke resolusi ${height}p.`,
+        ].join('\n'),
+        { reply_markup: buildPendingKeyboard() },
+      );
       return;
     }
 
-    const height = Number(match[1]);
-    const chatId = ctx.chat?.id;
+    if (data === 'convert:select') {
+      const chatId = ctx.chat?.id;
 
-    if (chatId !== undefined) {
-      pendingConversions.set(chatId, height);
+      if (chatId !== undefined) {
+        pendingConversions.delete(chatId);
+      }
+
+      await ctx.answerCallbackQuery();
+      await ctx.editMessageText(RESOLUTION_MENU_TEXT, {
+        reply_markup: buildResolutionKeyboard(),
+      });
+      return;
+    }
+
+    if (data === 'convert:cancel') {
+      const chatId = ctx.chat?.id;
+
+      if (chatId !== undefined) {
+        pendingConversions.delete(chatId);
+      }
+
+      await ctx.answerCallbackQuery();
+      await ctx.editMessageText(
+        'Konversi dibatalkan. Kirim link video biasa untuk mengunduh tanpa mengubah ukuran.',
+      );
+      return;
     }
 
     await ctx.answerCallbackQuery();
-    await ctx.reply(
-      `Siap! Kirimkan link video yang ingin dikonversi ke resolusi ${height}p.`,
-    );
   });
 
   bot.on('message:text', async (ctx) => {
