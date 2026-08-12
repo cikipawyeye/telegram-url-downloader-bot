@@ -85,6 +85,15 @@ export function registerBotHandlers(
 
   bot.on('callback_query:data', async (ctx) => {
     const data = ctx.callbackQuery.data;
+
+    const stopMatch = data.match(/^stop:download:(\d+)$/);
+    if (stopMatch) {
+      const statusMessageId = Number(stopMatch[1]);
+      const cancelled = videoMessageProcessor.cancelDownload(statusMessageId);
+      await ctx.answerCallbackQuery(cancelled ? 'Menghentikan unduhan...' : 'Tidak ada proses yang sedang berjalan.');
+      return;
+    }
+
     const resolutionMatch = data.match(/^convert:(\d+)$/);
 
     if (resolutionMatch) {

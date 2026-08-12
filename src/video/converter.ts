@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import { DownloadCancelledError } from './downloader.js';
 import type { DownloadedVideo } from './utils.js';
 
 export type ConvertedVideo = DownloadedVideo & {
@@ -29,6 +30,7 @@ export class VideoConverter {
     video: DownloadedVideo;
     outputDir: string;
     targetHeight: number;
+    signal?: AbortSignal;
     onProgress?: (percent: number) => void;
   }): Promise<ConvertedVideo> {
     const sourceWidth = options.video.width;
@@ -94,7 +96,7 @@ export class VideoConverter {
       '-max_muxing_queue_size',
       '1024',
       outputFilePath,
-    ], options.onProgress);
+    ], options.onProgress, options.signal);
 
     const stat = await fsp.stat(outputFilePath);
     const dimensions = await this.probeDimensions(outputFilePath);
@@ -139,7 +141,12 @@ export class VideoConverter {
     }
   }
 
-  private runCommand(command: string, args: string[], onProgress?: (percent: number) => void): Promise<string> {
+  private runCommand(
+    command: string,
+    args: string[],
+    onProgress?: (percent: number) => void,
+    signal?: AbortSignal,
+  ): Promise<string> {
     return new Promise<string>((resolve, reject) => {
       const child = spawn(command, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -150,12 +157,40 @@ export class VideoConverter {
       let settled = false;
       let totalSeconds: number | null = null;
 
+      const cleanup = () => {
+        clearTimeout(timer);
+        if (signal) {
+          signal.removeEventListener('abort', onAbort);
+        }
+      };
+
+      const onAbort = () => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
+        child.kill('SIGKILL');
+        reject(new DownloadCancelledError());
+      };
+
+      if (signal) {
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+
       const timer = setTimeout(() => {
         if (settled) {
           return;
         }
 
         settled = true;
+        cleanup();
         child.kill('SIGKILL');
         reject(new Error(`${command} timeout setelah ${Math.round(this.commandTimeoutMs / 1000)} detik.`));
       }, this.commandTimeoutMs);
@@ -193,7 +228,7 @@ export class VideoConverter {
         }
 
         settled = true;
-        clearTimeout(timer);
+        cleanup();
         reject(error);
       });
 
@@ -203,7 +238,7 @@ export class VideoConverter {
         }
 
         settled = true;
-        clearTimeout(timer);
+        cleanup();
 
         if (code === 0) {
           resolve(stdout);

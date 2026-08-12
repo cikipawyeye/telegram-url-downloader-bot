@@ -3,6 +3,7 @@ import type { StatusMessage } from '../telegram/notifier.js';
 import type { TelegramNotifier } from '../telegram/notifier.js';
 import { buildDeliveryFileName, buildDeliveryPartFileName, buildPartCaption, extractFirstUrl, formatBytes, formatDownloadProgress, truncateCaption, type VideoDownloadProgress, type VideoThumbnail } from './utils.js';
 import type { VideoDownloader } from './downloader.js';
+import { DownloadCancelledError } from './downloader.js';
 import type { VideoScreenshotGenerator } from './screenshots.js';
 import type { VideoSplitter } from './splitter.js';
 import type { VideoConverter } from './converter.js';
@@ -25,6 +26,7 @@ export class VideoMessageProcessor {
   private readonly workspaceManager: WorkspaceManager;
   private readonly screenshotCount: number;
   private readonly sendVideoInAlbum: boolean;
+  private readonly pendingCancellations = new Map<number, AbortController>();
 
   constructor(options: {
     maxFileSizeBytes: number;
@@ -46,6 +48,18 @@ export class VideoMessageProcessor {
     this.sendVideoInAlbum = options.sendVideoInAlbum;
   }
 
+  cancelDownload(statusMessageId: number): boolean {
+    const controller = this.pendingCancellations.get(statusMessageId);
+
+    if (!controller || controller.signal.aborted) {
+      return false;
+    }
+
+    controller.abort();
+    this.pendingCancellations.delete(statusMessageId);
+    return true;
+  }
+
   async process({ notifier, text, userId, convertToHeight }: ProcessVideoMessageRequest): Promise<void> {
     const url = extractFirstUrl(text.trim());
 
@@ -60,7 +74,22 @@ export class VideoMessageProcessor {
       workspace = await this.workspaceManager.create(userId);
       const acceptedMessage = await notifier.sendAccepted();
 
-      void this.processDownload(notifier, acceptedMessage, workspace.dirPath, url, convertToHeight);
+      const controller = new AbortController();
+      this.pendingCancellations.set(acceptedMessage.messageId, controller);
+
+      await notifier.addDownloadStopButton(
+        acceptedMessage,
+        `stop:download:${acceptedMessage.messageId}`,
+      );
+
+      void this.processDownload(
+        notifier,
+        acceptedMessage,
+        workspace.dirPath,
+        url,
+        convertToHeight,
+        controller.signal,
+      );
     } catch (error) {
       if (workspace) {
         await this.workspaceManager.remove(workspace);
@@ -76,11 +105,13 @@ export class VideoMessageProcessor {
     outputDir: string,
     url: string,
     convertToHeight?: number,
+    signal?: AbortSignal,
   ): Promise<void> {
     try {
       let video = await this.videoDownloader.download({
         url,
         outputDir,
+        signal,
         onProgress: (progress) => {
           void this.reportDownloadProgress(notifier, acceptedMessage, progress);
         },
@@ -96,6 +127,7 @@ export class VideoMessageProcessor {
           video,
           outputDir,
           targetHeight: convertToHeight,
+          signal,
           onProgress: (percent) => {
             void this.reportConversionProgress(notifier, acceptedMessage, convertToHeight, percent);
           },
@@ -111,6 +143,10 @@ export class VideoMessageProcessor {
           `Download selesai. Sedang membuat ${this.screenshotCount} screenshot video...`,
         );
       }
+
+      // Download/conversion is done; the stop button is no longer meaningful,
+      // so remove it from the status message.
+      await notifier.removeDownloadStopButton(acceptedMessage);
 
       const screenshots = await this.tryGenerateScreenshots({
         acceptedMessage,
@@ -210,9 +246,14 @@ export class VideoMessageProcessor {
         console.error('Failed to delete status message:', error);
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Terjadi error.';
-      await notifier.updateStatus(acceptedMessage, `Gagal memproses link.\n${message}`);
+      if (error instanceof DownloadCancelledError) {
+        await notifier.confirmStopped(acceptedMessage);
+      } else {
+        const message = error instanceof Error ? error.message : 'Terjadi error.';
+        await notifier.updateStatus(acceptedMessage, `Gagal memproses link.\n${message}`);
+      }
     } finally {
+      this.pendingCancellations.delete(acceptedMessage.messageId);
       await this.workspaceManager.remove({ dirPath: outputDir });
     }
   }

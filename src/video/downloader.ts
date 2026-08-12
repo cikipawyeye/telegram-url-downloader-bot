@@ -11,9 +11,17 @@ import { type DownloadedVideo, type VideoDownloadProgress } from './utils.js';
 const SINGLE_FILE_VIDEO_FORMAT = 'best[ext=mp4][vcodec^=avc1][acodec^=mp4a]/best[ext=mp4]/best';
 const METADATA_PROBE_TIMEOUT_MS = 30_000;
 
+export class DownloadCancelledError extends Error {
+  constructor() {
+    super('Unduhan dibatalkan oleh pengguna.');
+    this.name = 'DownloadCancelledError';
+  }
+}
+
 export type DownloadVideoOptions = {
   url: string;
   outputDir: string;
+  signal?: AbortSignal;
   onProgress?: (progress: VideoDownloadProgress) => void;
 };
 
@@ -44,7 +52,7 @@ export class VideoDownloader {
     this.ytdlp = options.ytdlp;
   }
 
-  async download({ onProgress, outputDir, url }: DownloadVideoOptions): Promise<DownloadedVideo> {
+  async download({ onProgress, outputDir, signal, url }: DownloadVideoOptions): Promise<DownloadedVideo> {
     const outputTemplate = path.join(outputDir, 'download.%(ext)s');
     const download = this.ytdlp.download(url, {
       format: SINGLE_FILE_VIDEO_FORMAT,
@@ -62,13 +70,43 @@ export class VideoDownloader {
       });
     }
 
-    const result = await this.runWithTimeout(download);
+    const result = await this.runWithTimeout(download, signal);
     return await this.resolveDownloadedVideo(result, outputDir);
   }
 
-  private async runWithTimeout(download: ReturnType<YtDlp['download']>): Promise<DownloadFinishResult> {
+  private async runWithTimeout(
+    download: ReturnType<YtDlp['download']>,
+    signal?: AbortSignal,
+  ): Promise<DownloadFinishResult> {
     return await new Promise<DownloadFinishResult>((resolve, reject) => {
       let settled = false;
+
+      const cleanup = () => {
+        clearTimeout(timer);
+        if (signal) {
+          signal.removeEventListener('abort', onAbort);
+        }
+      };
+
+      const onAbort = () => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
+        download.kill('SIGKILL');
+        reject(new DownloadCancelledError());
+      };
+
+      if (signal) {
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
 
       const timer = setTimeout(() => {
         if (settled) {
@@ -76,6 +114,7 @@ export class VideoDownloader {
         }
 
         settled = true;
+        cleanup();
         download.kill('SIGKILL');
         reject(new Error(`Proses download timeout setelah ${Math.round(this.downloadTimeoutMs / 1000)} detik.`));
       }, this.downloadTimeoutMs);
@@ -87,7 +126,7 @@ export class VideoDownloader {
           }
 
           settled = true;
-          clearTimeout(timer);
+          cleanup();
           resolve(result);
         },
         (error: unknown) => {
@@ -96,7 +135,7 @@ export class VideoDownloader {
           }
 
           settled = true;
-          clearTimeout(timer);
+          cleanup();
           reject(error);
         },
       );
