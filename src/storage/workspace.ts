@@ -21,11 +21,6 @@ export class WorkspaceManager {
     await this.sweepOrphans();
   }
 
-  async getFreeSpaceBytes(dirPath: string = this.rootDir): Promise<number> {
-    const stats = await fsp.statfs(dirPath);
-    return stats.bavail * stats.bsize;
-  }
-
   async sweepOrphans(): Promise<void> {
     let entries: string[] = [];
 

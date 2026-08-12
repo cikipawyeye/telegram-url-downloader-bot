@@ -36,12 +36,6 @@ export class TelegramNotifier {
     await this.ctx.reply('Kirim URL yang valid ya.');
   }
 
-  async sendStorageLow(): Promise<void> {
-    await this.ctx.reply(
-      'Maaf, storage server sedang hampir penuh. Silakan coba lagi beberapa saat lagi.',
-    );
-  }
-
   async sendAccepted(): Promise<StatusMessage> {
     const message = await this.ctx.reply('Link diterima. Sedang mencoba mendownload video...');
     this.lastStatusText = message.text;

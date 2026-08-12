@@ -54,13 +54,6 @@ export class VideoMessageProcessor {
       return;
     }
 
-    const freeSpaceBytes = await this.workspaceManager.getFreeSpaceBytes();
-
-    if (freeSpaceBytes < MIN_FREE_SPACE_BYTES) {
-      await notifier.sendStorageLow();
-      return;
-    }
-
     let workspace: DownloadWorkspace | null = null;
 
     try {
