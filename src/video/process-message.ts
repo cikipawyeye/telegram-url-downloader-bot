@@ -5,6 +5,7 @@ import { buildDeliveryFileName, buildDeliveryPartFileName, buildPartCaption, ext
 import type { VideoDownloader } from './downloader.js';
 import type { VideoScreenshotGenerator } from './screenshots.js';
 import type { VideoSplitter } from './splitter.js';
+import type { VideoConverter } from './converter.js';
 
 const MIN_FREE_SPACE_BYTES = 1024 * 1024 * 1024; // 1 GiB
 
@@ -12,6 +13,7 @@ export type ProcessVideoMessageRequest = {
   notifier: TelegramNotifier;
   text: string;
   userId: string;
+  convertToHeight?: number;
 };
 
 export class VideoMessageProcessor {
@@ -19,6 +21,7 @@ export class VideoMessageProcessor {
   private readonly videoDownloader: VideoDownloader;
   private readonly videoScreenshotGenerator: VideoScreenshotGenerator;
   private readonly videoSplitter: VideoSplitter;
+  private readonly videoConverter: VideoConverter;
   private readonly workspaceManager: WorkspaceManager;
   private readonly screenshotCount: number;
   private readonly sendVideoInAlbum: boolean;
@@ -28,6 +31,7 @@ export class VideoMessageProcessor {
     videoDownloader: VideoDownloader;
     videoScreenshotGenerator: VideoScreenshotGenerator;
     videoSplitter: VideoSplitter;
+    videoConverter: VideoConverter;
     workspaceManager: WorkspaceManager;
     screenshotCount: number;
     sendVideoInAlbum: boolean;
@@ -36,12 +40,13 @@ export class VideoMessageProcessor {
     this.videoDownloader = options.videoDownloader;
     this.videoScreenshotGenerator = options.videoScreenshotGenerator;
     this.videoSplitter = options.videoSplitter;
+    this.videoConverter = options.videoConverter;
     this.workspaceManager = options.workspaceManager;
     this.screenshotCount = options.screenshotCount;
     this.sendVideoInAlbum = options.sendVideoInAlbum;
   }
 
-  async process({ notifier, text, userId }: ProcessVideoMessageRequest): Promise<void> {
+  async process({ notifier, text, userId, convertToHeight }: ProcessVideoMessageRequest): Promise<void> {
     const url = extractFirstUrl(text.trim());
 
     if (!url) {
@@ -62,7 +67,7 @@ export class VideoMessageProcessor {
       workspace = await this.workspaceManager.create(userId);
       const acceptedMessage = await notifier.sendAccepted();
 
-      void this.processDownload(notifier, acceptedMessage, workspace.dirPath, url);
+      void this.processDownload(notifier, acceptedMessage, workspace.dirPath, url, convertToHeight);
     } catch (error) {
       if (workspace) {
         await this.workspaceManager.remove(workspace);
@@ -77,9 +82,10 @@ export class VideoMessageProcessor {
     acceptedMessage: StatusMessage,
     outputDir: string,
     url: string,
+    convertToHeight?: number,
   ): Promise<void> {
     try {
-      const video = await this.videoDownloader.download({
+      let video = await this.videoDownloader.download({
         url,
         outputDir,
         onProgress: (progress) => {
@@ -87,10 +93,31 @@ export class VideoMessageProcessor {
         },
       });
 
-      await notifier.updateStatus(
-        acceptedMessage,
-        `Download selesai. Sedang membuat ${this.screenshotCount} screenshot video...`,
-      );
+      if (convertToHeight !== undefined) {
+        await notifier.updateStatus(
+          acceptedMessage,
+          `Download selesai. Sedang mengonversi video ke resolusi ${convertToHeight}p...`,
+        );
+
+        video = await this.videoConverter.convert({
+          video,
+          outputDir,
+          targetHeight: convertToHeight,
+          onProgress: (percent) => {
+            void this.reportConversionProgress(notifier, acceptedMessage, convertToHeight, percent);
+          },
+        });
+
+        await notifier.updateStatus(
+          acceptedMessage,
+          'Konversi selesai. Sedang membuat screenshot video...',
+        );
+      } else {
+        await notifier.updateStatus(
+          acceptedMessage,
+          `Download selesai. Sedang membuat ${this.screenshotCount} screenshot video...`,
+        );
+      }
 
       const screenshots = await this.tryGenerateScreenshots({
         acceptedMessage,
@@ -243,6 +270,22 @@ export class VideoMessageProcessor {
       );
 
       return undefined;
+    }
+  }
+
+  private async reportConversionProgress(
+    notifier: TelegramNotifier,
+    acceptedMessage: StatusMessage,
+    targetHeight: number,
+    percent: number,
+  ): Promise<void> {
+    try {
+      await notifier.updateStatus(
+        acceptedMessage,
+        `Sedang mengonversi ke resolusi ${targetHeight}p... ${percent}%`,
+      );
+    } catch (error) {
+      console.error('Failed to update conversion progress:', error);
     }
   }
 

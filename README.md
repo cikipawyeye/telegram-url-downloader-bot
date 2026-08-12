@@ -9,6 +9,7 @@ Bot ini menerima URL dari user, mencoba mengunduh videonya dengan `yt-dlp`, lalu
 - kirim kembali memakai `sendVideo` + `supports_streaming: true`
 - auto cleanup file sementara
 - auto split video yang melebihi batas upload menjadi beberapa part
+- menu `/convert` untuk mengubah ukuran video ke resolusi 1080p / 720p / 480p / 240p (kompatibel streaming di Telegram)
 - screenshot + video dikirim dalam satu album/media group (bisa dimatikan dengan `SEND_VIDEO_IN_ALBUM=false`)
 - health check endpoint
 

@@ -7,6 +7,7 @@ import { createHttpApp } from './http/create-app.js';
 import { WorkspaceManager } from './storage/workspace.js';
 import { registerBotHandlers, BOT_COMMANDS } from './telegram/register-handlers.js';
 import { VideoDownloader } from './video/downloader.js';
+import { VideoConverter } from './video/converter.js';
 import { VideoMessageProcessor } from './video/process-message.js';
 import { VideoScreenshotGenerator } from './video/screenshots.js';
 import { VideoSplitter } from './video/splitter.js';
@@ -41,6 +42,9 @@ async function bootstrap(): Promise<void> {
     videoSplitter: new VideoSplitter({
       commandTimeoutMs: config.downloadTimeoutMs,
     }),
+    videoConverter: new VideoConverter({
+      commandTimeoutMs: config.downloadTimeoutMs,
+    }),
     workspaceManager,
     screenshotCount: config.screenshotCount,
     sendVideoInAlbum: config.sendVideoInAlbum,
@@ -60,7 +64,7 @@ async function bootstrap(): Promise<void> {
 
     await bot.api.setWebhook(webhookUrl, {
       drop_pending_updates: true,
-      allowed_updates: ['message'],
+      allowed_updates: ['message', 'callback_query'],
     });
 
     await configureBotCommands(bot);
