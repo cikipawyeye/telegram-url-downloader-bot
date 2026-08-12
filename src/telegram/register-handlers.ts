@@ -41,9 +41,9 @@ function buildResolutionKeyboard(): InlineKeyboard {
 
 function buildPendingKeyboard(): InlineKeyboard {
   return new InlineKeyboard()
-    .text('Pilih resolusi lain', 'convert:select')
+    .text('🔄 Pilih resolusi lain', 'convert:select')
     .row()
-    .text('Batal', 'convert:cancel');
+    .text('❌ Batal', 'convert:cancel');
 }
 
 // In-memory pending conversion resolution per chat. The chosen resolution is
