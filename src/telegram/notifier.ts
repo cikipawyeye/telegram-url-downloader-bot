@@ -96,6 +96,10 @@ export class TelegramNotifier {
           supports_streaming: boolean;
         }
     > = [
+      ...screenshots.map((screenshot) => ({
+        type: 'photo' as const,
+        media: new InputFile(screenshot.filePath, screenshot.fileName),
+      })),
       {
         type: 'video',
         media: new InputFile(video.filePath, video.fileName),
@@ -104,10 +108,6 @@ export class TelegramNotifier {
         height: video.height,
         supports_streaming: true,
       },
-      ...screenshots.map((screenshot) => ({
-        type: 'photo' as const,
-        media: new InputFile(screenshot.filePath, screenshot.fileName),
-      })),
     ];
 
     await this.bot.api.sendMediaGroup(this.getChatId(), media);
