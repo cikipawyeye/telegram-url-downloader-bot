@@ -18,10 +18,12 @@ export class VideoConverter {
   }
 
   /**
-   * Re-encodes the given video to a target height (kept within the source
-   * height to avoid upscaling), preserving aspect ratio. The output uses
-   * H.264 + AAC + yuv420p + faststart so it is small and streamable in
-   * Telegram.
+   * Re-encodes the given video so its *short edge* does not exceed the target
+   * height (kept within the source size to avoid upscaling), preserving aspect
+   * ratio. For landscape/square sources the short edge is the height; for
+   * portrait sources it is the width, so the filter caps whichever axis keeps
+   * the most detail. The output uses H.264 + AAC + yuv420p + faststart so it
+   * is small and streamable in Telegram.
    */
   async convert(options: {
     video: DownloadedVideo;
@@ -29,11 +31,35 @@ export class VideoConverter {
     targetHeight: number;
     onProgress?: (percent: number) => void;
   }): Promise<ConvertedVideo> {
+    const sourceWidth = options.video.width;
     const sourceHeight = options.video.height;
-    const effectiveTargetHeight =
-      sourceHeight !== undefined && sourceHeight > 0
-        ? Math.min(options.targetHeight, sourceHeight)
-        : options.targetHeight;
+
+    // A "720p" target means the *short edge* of the video is capped at 720.
+    // For landscape (or square) sources the short edge is the height, but for
+    // portrait sources it is the width. If we always clamp the height, a
+    // 720x1280 portrait video collapses to 405x720 and loses ~68% of its
+    // pixels. Detect the orientation and cap the short edge so portrait
+    // quality is preserved.
+    const isPortrait =
+      sourceWidth !== undefined &&
+      sourceWidth > 0 &&
+      sourceHeight !== undefined &&
+      sourceHeight > sourceWidth;
+
+    let scaleFilter: string;
+    if (isPortrait) {
+      const effectiveTargetWidth =
+        sourceWidth !== undefined && sourceWidth > 0
+          ? Math.min(options.targetHeight, sourceWidth)
+          : options.targetHeight;
+      scaleFilter = `scale=min(${effectiveTargetWidth}\\,iw):-2`;
+    } else {
+      const effectiveTargetHeight =
+        sourceHeight !== undefined && sourceHeight > 0
+          ? Math.min(options.targetHeight, sourceHeight)
+          : options.targetHeight;
+      scaleFilter = `scale=-2:min(${effectiveTargetHeight}\\,ih)`;
+    }
 
     const outputFilePath = path.join(options.outputDir, 'converted.mp4');
 
@@ -50,7 +76,7 @@ export class VideoConverter {
       '-map',
       '0:a:0?',
       '-vf',
-      `scale=-2:min(${effectiveTargetHeight}\\,ih)`,
+      scaleFilter,
       '-c:v',
       'libx264',
       '-preset',
