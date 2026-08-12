@@ -5,7 +5,7 @@ import { YtDlp } from 'ytdlp-nodejs';
 import { loadConfig } from './config.js';
 import { createHttpApp } from './http/create-app.js';
 import { WorkspaceManager } from './storage/workspace.js';
-import { registerBotHandlers } from './telegram/register-handlers.js';
+import { registerBotHandlers, BOT_COMMANDS } from './telegram/register-handlers.js';
 import { VideoDownloader } from './video/downloader.js';
 import { VideoMessageProcessor } from './video/process-message.js';
 import { VideoScreenshotGenerator } from './video/screenshots.js';
@@ -63,6 +63,8 @@ async function bootstrap(): Promise<void> {
       allowed_updates: ['message'],
     });
 
+    await configureBotCommands(bot);
+
     console.log(`Webhook set to ${webhookUrl}`);
   });
 
@@ -85,6 +87,21 @@ async function bootstrap(): Promise<void> {
 
 function buildWebhookUrl(publicBaseUrl: string, webhookPath: string): string {
   return new URL(webhookPath, `${publicBaseUrl.replace(/\/+$/, '')}/`).toString();
+}
+
+async function configureBotCommands(bot: Bot<Context>): Promise<void> {
+  try {
+    await bot.api.setMyCommands(BOT_COMMANDS);
+
+    await bot.api.setMyDescription(
+      'Bot pengunduh video. Kirim link video (YouTube, TikTok, dsb.) sebagai pesan biasa, dan bot akan mengirimkannya kembali sebagai video yang bisa di-stream langsung di Telegram.',
+    );
+
+    await bot.api.setMyShortDescription('Unduh video dari link dan kirim balik sebagai video streamable di Telegram.');
+    console.log('Bot commands & description configured');
+  } catch (error) {
+    console.error('Failed to configure bot commands/description:', error);
+  }
 }
 
 void bootstrap();
