@@ -10,6 +10,9 @@ const BUNKR_SIGN_ENDPOINT = 'https://glb-apisign.cdn.cr/sign';
 const BUNKR_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const BUNKR_REFERER = 'https://dl.bunkr.cr/';
+// The JSON/API calls are small, so fail fast instead of relying on the
+// (possibly much larger) download timeout.
+const BUNKR_API_TIMEOUT_MS = 30_000;
 
 // Pick a single progressive file that already contains both audio and video.
 // This avoids yt-dlp downloading separate video+audio streams and then merging
@@ -167,15 +170,7 @@ export class VideoDownloader {
       body = JSON.stringify(options.json);
     }
 
-    let response: Response;
-    try {
-      response = await fetch(url, { method: options.method, headers, body });
-    } catch (error) {
-      if (isAbortError(error)) {
-        throw new DownloadCancelledError();
-      }
-      throw new Error(`Bunk API gagal. ${formatError(error)}`);
-    }
+    const response = await this.fetchBunkJsonResponse(url, { method: options.method, headers, body });
 
     if (!response.ok) {
       const sample = await response.text().catch(() => '');
@@ -188,6 +183,40 @@ export class VideoDownloader {
       throw new Error(`Bunk API respons tidak valid JSON: ${text.slice(0, 200)}`);
     }
     return parsed;
+  }
+
+  private async fetchBunkJsonResponse(
+    url: string,
+    options: { method: string; headers: Record<string, string>; body?: string },
+  ): Promise<Response> {
+    const controller = new AbortController();
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, BUNKR_API_TIMEOUT_MS);
+
+    try {
+      return await fetch(url, {
+        body: options.body,
+        headers: options.headers,
+        method: options.method,
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (isAbortError(error)) {
+        if (timedOut) {
+          throw new Error(
+            `Bunk API timeout para ${describeBunkUrl(url)} setelah ${Math.round(BUNKR_API_TIMEOUT_MS / 1000)} detik.`,
+          );
+        }
+        throw new DownloadCancelledError();
+      }
+      throw new Error(`Bunk API gagal para ${describeBunkUrl(url)}. ${formatFetchError(error)}`);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async runBunkFileStream(options: {
@@ -244,7 +273,7 @@ export class VideoDownloader {
         signal,
       });
     } catch (error) {
-      throw this.mapBunkStreamError(error, isTimedOut);
+      throw this.mapBunkStreamError(error, isTimedOut, url);
     }
 
     if (!response.ok || response.body === null) {
@@ -288,7 +317,7 @@ export class VideoDownloader {
         emitProgress();
       }
     } catch (error) {
-      throw this.mapBunkStreamError(error, isTimedOut);
+      throw this.mapBunkStreamError(error, isTimedOut, url);
     } finally {
       await file.close().catch(() => undefined);
       bodyReader.cancel().catch(() => undefined);
@@ -299,14 +328,14 @@ export class VideoDownloader {
     return finalSize;
   }
 
-  private mapBunkStreamError(error: unknown, isTimedOut: () => boolean): Error {
+  private mapBunkStreamError(error: unknown, isTimedOut: () => boolean, url: string): Error {
     if (isTimedOut()) {
       return new Error(`Unduh Bunk timeout setelah ${Math.round(this.downloadTimeoutMs / 1000)} detik.`);
     }
     if (isAbortError(error)) {
       return new DownloadCancelledError();
     }
-    return error instanceof Error ? error : new Error(formatError(error));
+    return new Error(`Bunk unduh gagal para ${describeBunkUrl(url)}. ${formatFetchError(error)}`);
   }
 
   private async runWithTimeout(
@@ -634,6 +663,46 @@ function isAbortError(error: unknown): boolean {
 
   const candidate = error as { name?: unknown; code?: unknown };
   return candidate.name === 'AbortError' || candidate.code === 'ERR_ABORTED';
+}
+
+function formatFetchError(error: unknown): string {
+  if (typeof error !== 'object' || error === null) {
+    return String(error);
+  }
+
+  const parts: string[] = [];
+  const seen = new Set<object>();
+  let current: unknown = error;
+
+  // undici's fetch wraps the real failure in a chain: top-level TypeError
+  // ("fetch failed") -> cause -> ... -> the OS error (e.g. ENOTFOUND). Walk
+  // the chain and keep the meaningful messages, skipping the generic ones.
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current);
+
+    const entry = current as { code?: unknown; message?: unknown; cause?: unknown };
+    const code = typeof entry.code === 'string' ? entry.code : undefined;
+    const rawMessage = typeof entry.message === 'string' ? entry.message : undefined;
+    const message = rawMessage && rawMessage !== 'fetch failed' ? rawMessage : undefined;
+
+    const detail = code ? (message ? `${code}: ${message}` : code) : message;
+    if (detail && !parts.includes(detail)) {
+      parts.push(detail);
+    }
+
+    current = entry.cause;
+  }
+
+  return parts.length > 0 ? parts.join(' → ') : formatError(error);
+}
+
+function describeBunkUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.host}${parsed.pathname}`;
+  } catch {
+    return url;
+  }
 }
 
 function formatError(error: unknown): string {
