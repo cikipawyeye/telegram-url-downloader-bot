@@ -4,6 +4,13 @@ import path from 'node:path';
 import { type DownloadFinishResult, type VideoProgress as YtDlpVideoProgress, YtDlp } from 'ytdlp-nodejs';
 import { type DownloadedVideo, type VideoDownloadProgress } from './utils.js';
 
+// Sign endpoint that issues a time-limited token for a Bunkr media path.
+const BUNKR_SIGN_ENDPOINT = 'https://glb-apisign.cdn.cr/sign';
+// Bunkr may reject requests that look like a script; mimic a real browser.
+const BUNKR_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const BUNKR_REFERER = 'https://dl.bunkr.cr/';
+
 // Pick a single progressive file that already contains both audio and video.
 // This avoids yt-dlp downloading separate video+audio streams and then merging
 // them (which could need 3-4x the final size on disk). All fallbacks below
@@ -52,7 +59,12 @@ export class VideoDownloader {
     this.ytdlp = options.ytdlp;
   }
 
-  async download({ onProgress, outputDir, signal, url }: DownloadVideoOptions): Promise<DownloadedVideo> {
+  async download(options: DownloadVideoOptions): Promise<DownloadedVideo> {
+    if (isBunkrFileUrl(options.url)) {
+      return await this.downloadFromBunk(options);
+    }
+
+    const { onProgress, outputDir, signal, url } = options;
     const outputTemplate = path.join(outputDir, 'download.%(ext)s');
     const download = this.ytdlp.download(url, {
       format: SINGLE_FILE_VIDEO_FORMAT,
@@ -72,6 +84,229 @@ export class VideoDownloader {
 
     const result = await this.runWithTimeout(download, signal);
     return await this.resolveDownloadedVideo(result, outputDir);
+  }
+
+  private async downloadFromBunk({ onProgress, outputDir, signal, url }: DownloadVideoOptions): Promise<DownloadedVideo> {
+    const fileId = extractBunkrFileId(url);
+    if (fileId === undefined) {
+      throw new Error('Link Bunk tidak valid format. Hanya URL /file/<id> dukung.');
+    }
+
+    const origin = new URL(url).origin;
+    const detail = await this.fetchBunkDetail(fileId, origin);
+
+    const extension = path.extname(detail.original) || '.mp4';
+    const outputPath = path.join(outputDir, `bunk-video${extension}`);
+
+    const fileSize = await this.runBunkFileStream({
+      url: detail.downloadUrl,
+      outputPath,
+      signal,
+      onProgress,
+    });
+
+    const metadata = await this.resolveVideoMetadata(outputPath, {});
+
+    return {
+      filePath: outputPath,
+      fileSize,
+      title: detail.original,
+      durationSeconds: metadata.durationSeconds,
+      width: metadata.width,
+      height: metadata.height,
+    };
+  }
+
+  private async fetchBunkDetail(fileId: string, origin: string): Promise<{ downloadUrl: string; original: string }> {
+    const detail = await this.fetchBunkJson(`${origin}/api/_001_v2`, {
+      method: 'POST',
+      json: { id: fileId },
+    });
+
+    const mediaBase = readJsonString(detail, 'mediafiles');
+    const original = readJsonString(detail, 'original');
+    const mediaPath = readJsonString(detail, 'path');
+
+    if (!mediaBase || !original || !mediaPath) {
+      throw new Error('Bunk detail respons tidak komplet.');
+    }
+
+    const sign = await this.fetchBunkSignature(mediaPath);
+    const downloadUrl = `${mediaBase}${mediaPath}?n=${encodeURIComponent(original)}&token=${encodeURIComponent(sign.token)}&ex=${String(sign.ex)}`;
+
+    return { downloadUrl, original };
+  }
+
+  private async fetchBunkSignature(mediaPath: string): Promise<{ ex: string; token: string }> {
+    const signUrl = `${BUNKR_SIGN_ENDPOINT}?path=${encodeURIComponent(mediaPath)}`;
+    const data = await this.fetchBunkJson(signUrl, { method: 'GET' });
+
+    const token = readJsonString(data, 'token');
+    const ex = readJsonRaw(data, 'ex');
+
+    if (!token || ex === undefined) {
+      throw new Error('Bunk sign responsif tidak komplet.');
+    }
+
+    return { ex: String(ex), token };
+  }
+
+  private async fetchBunkJson(
+    url: string,
+    options: { method: 'GET' | 'POST'; json?: unknown },
+  ): Promise<Record<string, unknown>> {
+    const headers: Record<string, string> = {
+      'user-agent': BUNKR_USER_AGENT,
+      accept: 'application/json, text/plain, */*',
+      referer: BUNKR_REFERER,
+    };
+    let body: string | undefined;
+
+    if (options.json !== undefined) {
+      headers['content-type'] = 'application/json';
+      body = JSON.stringify(options.json);
+    }
+
+    let response: Response;
+    try {
+      response = await fetch(url, { method: options.method, headers, body });
+    } catch (error) {
+      if (isAbortError(error)) {
+        throw new DownloadCancelledError();
+      }
+      throw new Error(`Bunk API gagal. ${formatError(error)}`);
+    }
+
+    if (!response.ok) {
+      const sample = await response.text().catch(() => '');
+      throw new Error(`Bunk API responde HTTP ${response.status}${sample ? `: ${sample.slice(0, 200)}` : ''}`);
+    }
+
+    const text = await response.text().catch(() => '');
+    const parsed = parseJsonRecord(text);
+    if (parsed === undefined) {
+      throw new Error(`Bunk API respons tidak valid JSON: ${text.slice(0, 200)}`);
+    }
+    return parsed;
+  }
+
+  private async runBunkFileStream(options: {
+    url: string;
+    outputPath: string;
+    signal?: AbortSignal;
+    onProgress?: (progress: VideoDownloadProgress) => void;
+  }): Promise<number> {
+    const controller = new AbortController();
+    let timedOut = false;
+
+    const onExternalAbort = () => controller.abort();
+    if (options.signal) {
+      if (options.signal.aborted) {
+        throw new DownloadCancelledError();
+      }
+      options.signal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, this.downloadTimeoutMs);
+
+    try {
+      return await this.streamBunkHttpFile(
+        options.url,
+        options.outputPath,
+        controller.signal,
+        options.onProgress,
+        () => timedOut,
+      );
+    } finally {
+      clearTimeout(timeoutTimer);
+      options.signal?.removeEventListener('abort', onExternalAbort);
+    }
+  }
+
+  private async streamBunkHttpFile(
+    url: string,
+    outputPath: string,
+    signal: AbortSignal,
+    onProgress: ((progress: VideoDownloadProgress) => void) | undefined,
+    isTimedOut: () => boolean,
+  ): Promise<number> {
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        headers: {
+          'user-agent': BUNKR_USER_AGENT,
+          referer: BUNKR_REFERER,
+          accept: 'video/*',
+        },
+        signal,
+      });
+    } catch (error) {
+      throw this.mapBunkStreamError(error, isTimedOut);
+    }
+
+    if (!response.ok || response.body === null) {
+      const sample = await response.text().catch(() => '');
+      throw new Error(`Bunk unduh responde HTTP ${response.status}${sample ? `: ${sample.slice(0, 200)}` : ''}`);
+    }
+
+    const totalBytes = parseContentLength(response.headers.get('content-length'));
+    const bodyReader = response.body.getReader();
+    const started = Date.now();
+    let downloadedBytes = 0;
+    const file = await fsp.open(outputPath, 'w');
+
+    const emitProgress = () => {
+      if (onProgress === undefined) {
+        return;
+      }
+
+      const elapsedSeconds = Math.max(1, (Date.now() - started) / 1000);
+      const hasTotal = totalBytes !== undefined && totalBytes > 0;
+      onProgress({
+        status: 'downloading',
+        downloadedBytes,
+        totalBytes,
+        speedBytesPerSecond: downloadedBytes > 0 ? downloadedBytes / elapsedSeconds : undefined,
+        percent: hasTotal ? (downloadedBytes / totalBytes) * 100 : undefined,
+      });
+    };
+
+    try {
+      while (true) {
+        const { value, done } = await bodyReader.read();
+        if (done) {
+          break;
+        }
+        if (value === undefined || value.length === 0) {
+          continue;
+        }
+        await file.writeFile(value);
+        downloadedBytes += value.length;
+        emitProgress();
+      }
+    } catch (error) {
+      throw this.mapBunkStreamError(error, isTimedOut);
+    } finally {
+      await file.close().catch(() => undefined);
+      bodyReader.cancel().catch(() => undefined);
+    }
+
+    const finalSize = await fsp.stat(outputPath).then((entry) => entry.size).catch(() => downloadedBytes);
+    onProgress?.({ status: 'finished', downloadedBytes: finalSize });
+    return finalSize;
+  }
+
+  private mapBunkStreamError(error: unknown, isTimedOut: () => boolean): Error {
+    if (isTimedOut()) {
+      return new Error(`Unduh Bunk timeout setelah ${Math.round(this.downloadTimeoutMs / 1000)} detik.`);
+    }
+    if (isAbortError(error)) {
+      return new DownloadCancelledError();
+    }
+    return error instanceof Error ? error : new Error(formatError(error));
   }
 
   private async runWithTimeout(
@@ -344,4 +579,63 @@ function mapProgress(progress: YtDlpVideoProgress): VideoDownloadProgress {
     etaSeconds: progress.eta,
     percent: progress.percentage,
   };
+}
+
+function isBunkrFileUrl(url: string): boolean {
+  return /^https?:\/\/(?:[a-z0-9-]+\.)*bunkr\.[a-z]{2,}\/file\//i.test(url);
+}
+
+function extractBunkrFileId(url: string): string | undefined {
+  const match = url.match(/^https?:\/\/(?:[a-z0-9-]+\.)*bunkr\.[a-z]{2,}\/file\/([^\/?#]+)/i);
+  return match ? match[1] : undefined;
+}
+
+function readJsonString(source: Record<string, unknown>, key: string): string | undefined {
+  const value = source[key];
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (typeof value === 'number') {
+    return String(value);
+  }
+  return undefined;
+}
+
+function readJsonRaw(source: Record<string, unknown>, key: string): unknown {
+  return source[key];
+}
+
+function parseContentLength(value: string | null): number | undefined {
+  if (value === null) {
+    return undefined;
+  }
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : undefined;
+}
+
+function parseJsonRecord(text: string): Record<string, unknown> | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    return undefined;
+  }
+
+  if (typeof parsed !== 'object' || parsed === null) {
+    return undefined;
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function isAbortError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) {
+    return false;
+  }
+
+  const candidate = error as { name?: unknown; code?: unknown };
+  return candidate.name === 'AbortError' || candidate.code === 'ERR_ABORTED';
+}
+
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
