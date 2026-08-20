@@ -1,18 +1,63 @@
 import { spawn } from 'node:child_process';
+import * as dns from 'node:dns/promises';
+import type { LookupAddress, LookupOptions } from 'node:dns';
 import fsp from 'node:fs/promises';
+import * as https from 'node:https';
+import type { IncomingMessage } from 'node:http';
 import path from 'node:path';
 import { type DownloadFinishResult, type VideoProgress as YtDlpVideoProgress, YtDlp } from 'ytdlp-nodejs';
 import { type DownloadedVideo, type VideoDownloadProgress } from './utils.js';
 
 // Sign endpoint that issues a time-limited token for a Bunkr media path.
 const BUNKR_SIGN_ENDPOINT = 'https://glb-apisign.cdn.cr/sign';
-// Bunkr may reject requests that look like a script; mimic a real browser.
-const BUNKR_USER_AGENT =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const BUNKR_REFERER = 'https://dl.bunkr.cr/';
 // The JSON/API calls are small, so fail fast instead of relying on the
 // (possibly much larger) download timeout.
 const BUNKR_API_TIMEOUT_MS = 30_000;
+const BUNKR_ERROR_BODY_LIMIT = 64 * 1024;
+
+// Bunkr/Cloudflare can reject requests that look like a bot. Use the exact
+// browser header set captured from the official site (sec-ch-*, user-agent, etc.)
+const BUNKR_BROWSER_HEADERS: Record<string, string> = {
+  'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Linux"',
+  'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
+  'accept-language': 'en-US,en;q=0.9,id;q=0.8',
+  'sec-fetch-site': 'cross-site',
+  'sec-fetch-mode': 'navigate',
+  'sec-fetch-dest': 'document',
+  referer: BUNKR_REFERER,
+};
+
+// The default fetch (undici) sometimes picks an unroutable IPv6 address and
+// times out (UND_ERR_CONNECT_TIMEOUT), while IPv4 works fine. So Bunkr requests
+// go through node:https with an IPv4-only resolver (SNI/hostname stays intact).
+// The IPv4-only lookup resolves A records through node:dns and hands the socket
+// family 4, avoiding the flaky IPv6 connection entirely.
+function bunkrIpv4Lookup(
+  hostname: string,
+  options: LookupOptions,
+  callback: (err: NodeJS.ErrnoException | null, address: string | LookupAddress[], family?: number) => void,
+): void {
+  void dns.lookup(hostname, { family: 4, all: true }).then(
+    (addresses) => {
+      const ipv4 = addresses.filter((address) => address.family === 4);
+      if (options.all) {
+        callback(null, ipv4);
+      } else {
+        callback(null, ipv4[0]?.address ?? hostname, 4);
+      }
+    },
+    (error: Error) => callback(error, '', 4),
+  );
+}
+
+const BUNKR_HTTPS_AGENT = new https.Agent({
+  keepAlive: true,
+  lookup: bunkrIpv4Lookup,
+  maxSockets: 16,
+});
 
 // Pick a single progressive file that already contains both audio and video.
 // This avoids yt-dlp downloading separate video+audio streams and then merging
@@ -101,7 +146,7 @@ export class VideoDownloader {
     const extension = path.extname(detail.original) || '.mp4';
     const outputPath = path.join(outputDir, `bunk-video${extension}`);
 
-    const fileSize = await this.runBunkFileStream({
+    const fileSize = await this.downloadBunkFile({
       url: detail.downloadUrl,
       outputPath,
       signal,
@@ -159,9 +204,8 @@ export class VideoDownloader {
     options: { method: 'GET' | 'POST'; json?: unknown },
   ): Promise<Record<string, unknown>> {
     const headers: Record<string, string> = {
-      'user-agent': BUNKR_USER_AGENT,
+      ...BUNKR_BROWSER_HEADERS,
       accept: 'application/json, text/plain, */*',
-      referer: BUNKR_REFERER,
     };
     let body: string | undefined;
 
@@ -170,14 +214,12 @@ export class VideoDownloader {
       body = JSON.stringify(options.json);
     }
 
-    const response = await this.fetchBunkJsonResponse(url, { method: options.method, headers, body });
+    const { status, text } = await this.requestBunkText(url, options.method, headers, body, BUNKR_API_TIMEOUT_MS);
 
-    if (!response.ok) {
-      const sample = await response.text().catch(() => '');
-      throw new Error(`Bunk API responde HTTP ${response.status}${sample ? `: ${sample.slice(0, 200)}` : ''}`);
+    if (status < 200 || status >= 300) {
+      throw new Error(`Bunk API responde HTTP ${status}${text ? `: ${text.slice(0, 200)}` : ''}`);
     }
 
-    const text = await response.text().catch(() => '');
     const parsed = parseJsonRecord(text);
     if (parsed === undefined) {
       throw new Error(`Bunk API respons tidak valid JSON: ${text.slice(0, 200)}`);
@@ -185,41 +227,62 @@ export class VideoDownloader {
     return parsed;
   }
 
-  private async fetchBunkJsonResponse(
+  private async requestBunkText(
     url: string,
-    options: { method: string; headers: Record<string, string>; body?: string },
-  ): Promise<Response> {
+    method: 'GET' | 'POST',
+    headers: Record<string, string>,
+    body: string | undefined,
+    timeoutMs: number,
+  ): Promise<{ status: number; text: string }> {
     const controller = new AbortController();
     let timedOut = false;
 
     const timer = setTimeout(() => {
       timedOut = true;
       controller.abort();
-    }, BUNKR_API_TIMEOUT_MS);
+    }, timeoutMs);
 
     try {
-      return await fetch(url, {
-        body: options.body,
-        headers: options.headers,
-        method: options.method,
-        signal: controller.signal,
-      });
+      const response = await this.bunkRawRequest(new URL(url), method, headers, body, controller.signal);
+      const text = await readResponseBody(response).catch(() => '');
+      return { status: response.statusCode ?? 0, text };
     } catch (error) {
-      if (isAbortError(error)) {
-        if (timedOut) {
-          throw new Error(
-            `Bunk API timeout para ${describeBunkUrl(url)} setelah ${Math.round(BUNKR_API_TIMEOUT_MS / 1000)} detik.`,
-          );
-        }
-        throw new DownloadCancelledError();
-      }
-      throw new Error(`Bunk API gagal para ${describeBunkUrl(url)}. ${formatFetchError(error)}`);
+      throw this.mapBunkHttpError(error, timedOut, url, timeoutMs);
     } finally {
       clearTimeout(timer);
     }
   }
 
-  private async runBunkFileStream(options: {
+  private async bunkRawRequest(
+    url: URL,
+    method: string,
+    headers: Record<string, string>,
+    body: string | undefined,
+    signal: AbortSignal,
+  ): Promise<IncomingMessage> {
+    return await new Promise<IncomingMessage>((resolve, reject) => {
+      const request = https.request(
+        {
+          agent: BUNKR_HTTPS_AGENT,
+          headers,
+          hostname: url.hostname,
+          method,
+          path: `${url.pathname}${url.search}`,
+          port: url.port || 443,
+          servername: url.hostname,
+          signal,
+        },
+        (response) => resolve(response),
+      );
+      request.on('error', reject);
+      if (body) {
+        request.write(body);
+      }
+      request.end();
+    });
+  }
+
+  private async downloadBunkFile(options: {
     url: string;
     outputPath: string;
     signal?: AbortSignal;
@@ -242,59 +305,58 @@ export class VideoDownloader {
     }, this.downloadTimeoutMs);
 
     try {
-      return await this.streamBunkHttpFile(
-        options.url,
-        options.outputPath,
-        controller.signal,
-        options.onProgress,
-        () => timedOut,
-      );
+      return await this.streamBunkToFile({
+        url: options.url,
+        outputPath: options.outputPath,
+        signal: controller.signal,
+        onProgress: options.onProgress,
+        isTimedOut: () => timedOut,
+      });
     } finally {
       clearTimeout(timeoutTimer);
       options.signal?.removeEventListener('abort', onExternalAbort);
     }
   }
 
-  private async streamBunkHttpFile(
-    url: string,
-    outputPath: string,
-    signal: AbortSignal,
-    onProgress: ((progress: VideoDownloadProgress) => void) | undefined,
-    isTimedOut: () => boolean,
-  ): Promise<number> {
-    let response: Response;
+  private async streamBunkToFile(options: {
+    url: string;
+    outputPath: string;
+    signal: AbortSignal;
+    onProgress?: (progress: VideoDownloadProgress) => void;
+    isTimedOut: () => boolean;
+  }): Promise<number> {
+    let response: IncomingMessage;
     try {
-      response = await fetch(url, {
-        headers: {
-          'user-agent': BUNKR_USER_AGENT,
-          referer: BUNKR_REFERER,
-          accept: 'video/*',
-        },
-        signal,
-      });
+      response = await this.bunkRawRequest(
+        new URL(options.url),
+        'GET',
+        { ...BUNKR_BROWSER_HEADERS, accept: 'video/*' },
+        undefined,
+        options.signal,
+      );
     } catch (error) {
-      throw this.mapBunkStreamError(error, isTimedOut, url);
+      throw this.mapBunkHttpError(error, options.isTimedOut(), options.url, this.downloadTimeoutMs);
     }
 
-    if (!response.ok || response.body === null) {
-      const sample = await response.text().catch(() => '');
-      throw new Error(`Bunk unduh responde HTTP ${response.status}${sample ? `: ${sample.slice(0, 200)}` : ''}`);
+    const status = response.statusCode ?? 0;
+    if (status < 200 || status >= 300) {
+      const sample = await readResponseBody(response).catch(() => '');
+      throw new Error(`Bunk unduh responde HTTP ${status}${sample ? `: ${sample.slice(0, 200)}` : ''}`);
     }
 
-    const totalBytes = parseContentLength(response.headers.get('content-length'));
-    const bodyReader = response.body.getReader();
+    const totalBytes = parseContentLength(String(response.headers['content-length'] ?? ''));
     const started = Date.now();
     let downloadedBytes = 0;
-    const file = await fsp.open(outputPath, 'w');
+    const file = await fsp.open(options.outputPath, 'w');
 
     const emitProgress = () => {
-      if (onProgress === undefined) {
+      if (options.onProgress === undefined) {
         return;
       }
 
       const elapsedSeconds = Math.max(1, (Date.now() - started) / 1000);
       const hasTotal = totalBytes !== undefined && totalBytes > 0;
-      onProgress({
+      options.onProgress({
         status: 'downloading',
         downloadedBytes,
         totalBytes,
@@ -304,38 +366,31 @@ export class VideoDownloader {
     };
 
     try {
-      while (true) {
-        const { value, done } = await bodyReader.read();
-        if (done) {
-          break;
-        }
-        if (value === undefined || value.length === 0) {
-          continue;
-        }
-        await file.writeFile(value);
-        downloadedBytes += value.length;
+      for await (const chunk of response) {
+        await file.writeFile(chunk);
+        downloadedBytes += chunk.length;
         emitProgress();
       }
     } catch (error) {
-      throw this.mapBunkStreamError(error, isTimedOut, url);
+      throw this.mapBunkHttpError(error, options.isTimedOut(), options.url, this.downloadTimeoutMs);
     } finally {
       await file.close().catch(() => undefined);
-      bodyReader.cancel().catch(() => undefined);
+      response.destroy();
     }
 
-    const finalSize = await fsp.stat(outputPath).then((entry) => entry.size).catch(() => downloadedBytes);
-    onProgress?.({ status: 'finished', downloadedBytes: finalSize });
+    const finalSize = await fsp.stat(options.outputPath).then((entry) => entry.size).catch(() => downloadedBytes);
+    options.onProgress?.({ status: 'finished', downloadedBytes: finalSize });
     return finalSize;
   }
 
-  private mapBunkStreamError(error: unknown, isTimedOut: () => boolean, url: string): Error {
-    if (isTimedOut()) {
-      return new Error(`Unduh Bunk timeout setelah ${Math.round(this.downloadTimeoutMs / 1000)} detik.`);
+  private mapBunkHttpError(error: unknown, timedOut: boolean, url: string, timeoutMs: number): Error {
+    if (timedOut) {
+      return new Error(`Bunk timeout para ${describeBunkUrl(url)} setelah ${Math.round(timeoutMs / 1000)} detik.`);
     }
     if (isAbortError(error)) {
       return new DownloadCancelledError();
     }
-    return new Error(`Bunk unduh gagal para ${describeBunkUrl(url)}. ${formatFetchError(error)}`);
+    return new Error(`Bunk gagal para ${describeBunkUrl(url)}. ${formatFetchError(error)}`);
   }
 
   private async runWithTimeout(
@@ -640,6 +695,17 @@ function parseContentLength(value: string | null): number | undefined {
   }
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? number : undefined;
+}
+
+async function readResponseBody(response: IncomingMessage): Promise<string> {
+  let text = '';
+  for await (const chunk of response) {
+    text += chunk;
+    if (text.length >= BUNKR_ERROR_BODY_LIMIT) {
+      break;
+    }
+  }
+  return text;
 }
 
 function parseJsonRecord(text: string): Record<string, unknown> | undefined {

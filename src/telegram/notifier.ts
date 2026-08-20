@@ -45,29 +45,17 @@ export class TelegramNotifier {
 
   async addDownloadStopButton(statusMessage: StatusMessage, callbackData: string): Promise<void> {
     const keyboard = new InlineKeyboard().text('⏹ Hentikan Unduhan', callbackData);
-    await this.bot.api.editMessageText(
-      this.getChatId(),
-      statusMessage.messageId,
-      this.lastStatusText ?? '',
-      { reply_markup: keyboard },
-    );
+    await this.editStatusText(statusMessage.messageId, this.lastStatusText ?? '', keyboard);
   }
 
   async removeDownloadStopButton(statusMessage: StatusMessage): Promise<void> {
-    await this.bot.api.editMessageText(
-      this.getChatId(),
-      statusMessage.messageId,
-      this.lastStatusText ?? '',
-      { reply_markup: new InlineKeyboard() },
-    );
+    await this.editStatusText(statusMessage.messageId, this.lastStatusText ?? '', new InlineKeyboard());
   }
 
   async confirmStopped(statusMessage: StatusMessage): Promise<void> {
     this.clearPendingProgress();
     this.statusMessageClosed = true;
-    await this.bot.api.editMessageText(this.getChatId(), statusMessage.messageId, 'Unduhan dihentikan.', {
-      reply_markup: new InlineKeyboard(),
-    });
+    await this.editStatusText(statusMessage.messageId, 'Unduhan dihentikan.', new InlineKeyboard());
   }
 
   async updateStatus(statusMessage: StatusMessage, text: string): Promise<void> {
@@ -173,6 +161,16 @@ export class TelegramNotifier {
       });
 
     await this.statusUpdateChain;
+  }
+
+  private async editStatusText(messageId: number, text: string, replyMarkup: InlineKeyboard): Promise<void> {
+    try {
+      await this.bot.api.editMessageText(this.getChatId(), messageId, text, { reply_markup: replyMarkup });
+    } catch (error) {
+      if (!isMessageNotModifiedError(error)) {
+        throw error;
+      }
+    }
   }
 
   private getChatId(): number {
