@@ -26,6 +26,8 @@ export class TelegramNotifier {
   private pendingProgressText: string | null = null;
   private statusMessageClosed = false;
   private statusUpdateChain: Promise<void> = Promise.resolve();
+  private stopButtonActive = false;
+  private stopButtonCallbackData: string | null = null;
 
   constructor(ctx: Context, bot: Bot<Context>) {
     this.ctx = ctx;
@@ -40,21 +42,28 @@ export class TelegramNotifier {
     const message = await this.ctx.reply('Link diterima. Sedang mencoba mendownload video...');
     this.lastStatusText = message.text;
     this.statusMessageClosed = false;
+    this.stopButtonActive = false;
+    this.stopButtonCallbackData = null;
     return { messageId: message.message_id };
   }
 
   async addDownloadStopButton(statusMessage: StatusMessage, callbackData: string): Promise<void> {
-    const keyboard = new InlineKeyboard().text('⏹ Hentikan Unduhan', callbackData);
-    await this.editStatusText(statusMessage.messageId, this.lastStatusText ?? '', keyboard);
+    this.stopButtonActive = true;
+    this.stopButtonCallbackData = callbackData;
+    await this.editStatusText(statusMessage.messageId, this.lastStatusText ?? '', this.buildStatusKeyboard());
   }
 
   async removeDownloadStopButton(statusMessage: StatusMessage): Promise<void> {
-    await this.editStatusText(statusMessage.messageId, this.lastStatusText ?? '', new InlineKeyboard());
+    this.stopButtonActive = false;
+    this.stopButtonCallbackData = null;
+    await this.editStatusText(statusMessage.messageId, this.lastStatusText ?? '', this.buildStatusKeyboard());
   }
 
   async confirmStopped(statusMessage: StatusMessage): Promise<void> {
     this.clearPendingProgress();
     this.statusMessageClosed = true;
+    this.stopButtonActive = false;
+    this.stopButtonCallbackData = null;
     await this.editStatusText(statusMessage.messageId, 'Unduhan dihentikan.', new InlineKeyboard());
   }
 
@@ -151,6 +160,8 @@ export class TelegramNotifier {
   async deleteStatus(statusMessage: StatusMessage): Promise<void> {
     this.clearPendingProgress();
     this.statusMessageClosed = true;
+    this.stopButtonActive = false;
+    this.stopButtonCallbackData = null;
 
     this.statusUpdateChain = this.statusUpdateChain
       .catch(() => undefined)
@@ -161,6 +172,14 @@ export class TelegramNotifier {
       });
 
     await this.statusUpdateChain;
+  }
+
+  private buildStatusKeyboard(): InlineKeyboard {
+    if (!this.stopButtonActive || !this.stopButtonCallbackData) {
+      return new InlineKeyboard();
+    }
+
+    return new InlineKeyboard().text('⏹ Hentikan Unduhan', this.stopButtonCallbackData);
   }
 
   private async editStatusText(messageId: number, text: string, replyMarkup: InlineKeyboard): Promise<void> {
@@ -223,7 +242,9 @@ export class TelegramNotifier {
         }
 
         try {
-          await this.bot.api.editMessageText(this.getChatId(), statusMessage.messageId, text);
+          await this.bot.api.editMessageText(this.getChatId(), statusMessage.messageId, text, {
+            reply_markup: this.buildStatusKeyboard(),
+          });
         } catch (error) {
           if (!isMessageNotModifiedError(error)) {
             throw error;
