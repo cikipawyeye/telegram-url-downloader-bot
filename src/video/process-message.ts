@@ -1,14 +1,12 @@
-import type { DownloadWorkspace, WorkspaceManager } from '../storage/workspace.js';
+import type { WorkspaceManager } from '../storage/workspace.js';
 import type { StatusMessage } from '../telegram/notifier.js';
 import type { TelegramNotifier } from '../telegram/notifier.js';
-import { buildDeliveryFileName, buildDeliveryPartFileName, buildPartCaption, extractFirstUrl, formatBytes, formatDownloadProgress, truncateCaption, type VideoDownloadProgress, type VideoThumbnail } from './utils.js';
+import { buildDeliveryFileName, buildDeliveryPartFileName, buildPartCaption, extractUrls, formatBytes, formatDownloadProgress, truncateCaption, type VideoDownloadProgress, type VideoThumbnail } from './utils.js';
 import type { VideoDownloader } from './downloader.js';
 import { DownloadCancelledError } from './downloader.js';
 import type { VideoScreenshotGenerator } from './screenshots.js';
 import type { VideoSplitter } from './splitter.js';
 import type { VideoConverter } from './converter.js';
-
-const MIN_FREE_SPACE_BYTES = 1024 * 1024 * 1024; // 1 GiB
 
 export type ProcessVideoMessageRequest = {
   notifier: TelegramNotifier;
@@ -61,17 +59,20 @@ export class VideoMessageProcessor {
   }
 
   async process({ notifier, text, userId, convertToHeight }: ProcessVideoMessageRequest): Promise<void> {
-    const url = extractFirstUrl(text.trim());
+    const urls = extractUrls(text.trim());
 
-    if (!url) {
+    if (urls.length === 0) {
       await notifier.sendInvalidUrl();
       return;
     }
 
-    let workspace: DownloadWorkspace | null = null;
+    const maxBulkUrls = parseInt(process.env.MAX_BULK_URLS ?? '20', 10);
+    if (urls.length > maxBulkUrls) {
+      await notifier.sendBatchLimit(maxBulkUrls);
+      return;
+    }
 
     try {
-      workspace = await this.workspaceManager.create(userId);
       const acceptedMessage = await notifier.sendAccepted();
 
       const controller = new AbortController();
@@ -82,42 +83,83 @@ export class VideoMessageProcessor {
         `stop:download:${acceptedMessage.messageId}`,
       );
 
-      void this.processDownload(
+      void this.processBatch(
         notifier,
         acceptedMessage,
-        workspace.dirPath,
-        url,
+        urls,
+        userId,
         convertToHeight,
         controller.signal,
       );
     } catch (error) {
-      if (workspace) {
-        await this.workspaceManager.remove(workspace);
-      }
-
       throw error;
     }
   }
 
-  private async processDownload(
+  private async processBatch(
     notifier: TelegramNotifier,
     acceptedMessage: StatusMessage,
-    outputDir: string,
-    url: string,
+    urls: string[],
+    userId: string,
     convertToHeight?: number,
     signal?: AbortSignal,
   ): Promise<void> {
-    try {
-      let video = await this.videoDownloader.download({
-        url,
-        outputDir,
-        signal,
-        onProgress: (progress) => {
-          void this.reportDownloadProgress(notifier, acceptedMessage, progress);
-        },
-      });
+    const failed: string[] = [];
+    let completed = 0;
 
-      if (convertToHeight !== undefined) {
+    for (const [index, url] of urls.entries()) {
+      if (signal?.aborted) {
+        await notifier.confirmStopped(acceptedMessage);
+        this.pendingCancellations.delete(acceptedMessage.messageId);
+        return;
+      }
+
+      const workspace = await this.workspaceManager.create(userId);
+      await notifier.updateStatus(acceptedMessage, `Selesai ${completed}/${urls.length}. Memproses ${index + 1}/${urls.length}...`);
+
+      try {
+        const video = await this.videoDownloader.download({
+          url,
+          outputDir: workspace.dirPath,
+          signal,
+          onProgress: (progress) => {
+            void this.reportDownloadProgress(notifier, acceptedMessage, progress);
+          },
+        });
+        await this.processDownloadedVideo(notifier, acceptedMessage, workspace.dirPath, video, convertToHeight, signal);
+        completed += 1;
+      } catch (error) {
+        if (error instanceof DownloadCancelledError) {
+          await notifier.confirmStopped(acceptedMessage);
+          return;
+        }
+        failed.push(url);
+        console.error(`Failed to process bulk URL ${url}:`, error);
+        await notifier.updateStatus(acceptedMessage, `Link ${index + 1}/${urls.length} gagal. Lanjut ke link berikutnya...`);
+      } finally {
+        await this.workspaceManager.remove(workspace);
+      }
+    }
+
+    this.pendingCancellations.delete(acceptedMessage.messageId);
+    await notifier.removeDownloadStopButton(acceptedMessage);
+    if (failed.length === 0) {
+      await notifier.deleteStatus(acceptedMessage);
+    } else {
+      await notifier.updateStatus(acceptedMessage, `Bulk selesai: ${completed}/${urls.length} berhasil, ${failed.length} gagal.`);
+    }
+  }
+
+  private async processDownloadedVideo(
+    notifier: TelegramNotifier,
+    acceptedMessage: StatusMessage,
+    outputDir: string,
+    initialVideo: Awaited<ReturnType<VideoDownloader['download']>>,
+    convertToHeight?: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    let video = initialVideo;
+    if (convertToHeight !== undefined) {
         await notifier.updateStatus(
           acceptedMessage,
           `Download selesai. Sedang mengonversi video ke resolusi ${convertToHeight}p...`,
@@ -142,34 +184,30 @@ export class VideoMessageProcessor {
           acceptedMessage,
           `Download selesai. Sedang membuat ${this.screenshotCount} screenshot video...`,
         );
-      }
+    }
 
-      // Download/conversion is done; the stop button is no longer meaningful,
-      // so remove it from the status message.
-      await notifier.removeDownloadStopButton(acceptedMessage);
-
-      const screenshots = await this.tryGenerateScreenshots({
+    const screenshots = await this.tryGenerateScreenshots({
         acceptedMessage,
         notifier,
         outputDir,
         video,
       });
 
-      await notifier.updateStatus(
+    await notifier.updateStatus(
         acceptedMessage,
         screenshots.length > 0
           ? 'Screenshot selesai. Sedang membuat thumbnail video...'
           : 'Sedang membuat thumbnail video...',
       );
 
-      const thumbnail = await this.tryGenerateThumbnail({
+    const thumbnail = await this.tryGenerateThumbnail({
         acceptedMessage,
         notifier,
         outputDir,
         video,
       });
 
-      await notifier.updateStatus(
+    await notifier.updateStatus(
         acceptedMessage,
         video.fileSize > this.maxFileSizeBytes
           ? `Video lebih dari ${formatBytes(this.maxFileSizeBytes)}, sedang memecah video...`
@@ -178,14 +216,14 @@ export class VideoMessageProcessor {
             : 'Sedang mengirim video ke Telegram...',
       );
 
-      const segments = await this.videoSplitter.split(video, outputDir, this.maxFileSizeBytes);
+    const segments = await this.videoSplitter.split(video, outputDir, this.maxFileSizeBytes);
 
-      const shouldCombine =
+    const shouldCombine =
         this.sendVideoInAlbum &&
         notifier.canCombineScreenshotsWithVideo(screenshots.length) &&
         segments.length === 1;
 
-      await notifier.withMediaSendQueue(async () => {
+    await notifier.withMediaSendQueue(async () => {
         if (shouldCombine) {
           const segment = segments[0];
           await notifier.updateStatus(acceptedMessage, 'Screenshot & video siap. Sedang mengirim ke Telegram dalam satu album...');
@@ -223,29 +261,7 @@ export class VideoMessageProcessor {
             height: video.height,
           });
         }
-      });
-
-      try {
-        await notifier.deleteStatus(acceptedMessage);
-      } catch (error) {
-        console.error('Failed to delete status message:', error);
-      }
-    } catch (error) {
-      if (error instanceof DownloadCancelledError) {
-        await notifier.confirmStopped(acceptedMessage);
-      } else {
-        const message = error instanceof Error ? error.message : 'Terjadi error.';
-        try {
-          await notifier.removeDownloadStopButton(acceptedMessage);
-        } catch (buttonError) {
-          console.error('Failed to remove download stop button:', buttonError);
-        }
-        await notifier.updateStatus(acceptedMessage, `Gagal memproses link.\n${message}`);
-      }
-    } finally {
-      this.pendingCancellations.delete(acceptedMessage.messageId);
-      await this.workspaceManager.remove({ dirPath: outputDir });
-    }
+    });
   }
 
   private async tryGenerateScreenshots(options: {

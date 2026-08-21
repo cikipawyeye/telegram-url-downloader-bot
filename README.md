@@ -4,6 +4,7 @@ Bot ini menerima URL dari user, mencoba mengunduh videonya dengan `yt-dlp`, lalu
 
 ## Fitur
 - menerima link dari user via Telegram
+- bulk download hingga 10 URL dalam satu pesan (diproses berurutan)
 - webhook-ready untuk deployment
 - download dengan `yt-dlp`
 - unduh Bunkr (`https://*.bunkr.*/file/<id>` atau `/f/<id>`) pakai custom downloader (detail API → sign token → media), dengan dukung progress & batalkan

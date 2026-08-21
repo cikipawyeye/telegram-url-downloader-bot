@@ -33,9 +33,10 @@ type ScreenshotPlanItem = {
   captureSeconds: number;
 };
 
-export function extractFirstUrl(text: string): string | null {
-  const match = text.match(/https?:\/\/[^\s]+/i);
-  return match ? match[0] : null;
+export function extractUrls(text: string): string[] {
+  return [...text.matchAll(/https?:\/\/[^\s]+/gi)]
+    .map((match) => match[0].replace(/[),.!?;:]+$/g, ''))
+    .filter((url, index, urls) => urls.indexOf(url) === index);
 }
 
 export function buildDeliveryFileName(filePath: string, title: string): string {

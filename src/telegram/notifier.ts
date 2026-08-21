@@ -41,6 +41,10 @@ export class TelegramNotifier {
     await this.ctx.reply('Kirim URL yang valid ya.', { reply_parameters: this.replyParameters() });
   }
 
+  async sendBatchLimit(max: number): Promise<void> {
+    await this.ctx.reply(`Maksimal ${max} URL per pesan.`, { reply_parameters: this.replyParameters() });
+  }
+
   async sendAccepted(): Promise<StatusMessage> {
     const message = await this.ctx.reply('Link diterima. Sedang mencoba mendownload video...', {
       reply_parameters: this.replyParameters(),
