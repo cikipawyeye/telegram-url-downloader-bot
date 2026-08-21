@@ -124,7 +124,7 @@ export class VideoDownloader {
       throw new Error(`Bunk album merespons HTTP ${status}.`);
     }
 
-    const script = text.match(/window\.albumFiles\s*=\s*\[([\s\S]*?)\]\s*;?/i)?.[1];
+    const script = text.match(/(?:window\.)?albumFiles\s*=\s*\[([\s\S]*?)\]\s*;?/i)?.[1];
     if (!script) {
       throw new Error('Daftar file album Bunk tidak ditemukan.');
     }
@@ -132,8 +132,9 @@ export class VideoDownloader {
     const videos: string[] = [];
     for (const item of script.matchAll(/\{([\s\S]*?)\}/g)) {
       const entry = item[1];
-      const id = entry.match(/\bid\s*:\s*(\d+)/i)?.[1];
-      const type = entry.match(/\btype\s*:\s*["']([^"']+)["']/i)?.[1];
+      const idMatch = entry.match(/["']?id["']?\s*:\s*(?:["']([^"']+)["']|([a-z0-9_-]+))/i);
+      const id = idMatch?.[1] ?? idMatch?.[2];
+      const type = entry.match(/["']?(?:type|mime|mimetype)["']?\s*:\s*["']([^"']+)["']/i)?.[1];
       if (id && type?.toLowerCase().startsWith('video/')) {
         videos.push(`https://dl.bunkr.cr/file/${id}`);
       }
