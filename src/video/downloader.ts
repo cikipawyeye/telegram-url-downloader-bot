@@ -105,6 +105,43 @@ export class VideoDownloader {
     this.ytdlp = options.ytdlp;
   }
 
+  async expandUrl(url: string): Promise<string[]> {
+    if (!isBunkrAlbumUrl(url)) {
+      return [url];
+    }
+
+    const albumUrl = new URL(url);
+    albumUrl.searchParams.set('advanced', '1');
+    const { status, text } = await this.requestBunkText(
+      albumUrl.toString(),
+      'GET',
+      { ...BUNKR_BROWSER_HEADERS, accept: 'text/html,application/xhtml+xml' },
+      undefined,
+      BUNKR_API_TIMEOUT_MS,
+    );
+
+    if (status < 200 || status >= 300) {
+      throw new Error(`Bunk album merespons HTTP ${status}.`);
+    }
+
+    const script = text.match(/window\.albumFiles\s*=\s*\[([\s\S]*?)\]\s*;?/i)?.[1];
+    if (!script) {
+      throw new Error('Daftar file album Bunk tidak ditemukan.');
+    }
+
+    const videos: string[] = [];
+    for (const item of script.matchAll(/\{([\s\S]*?)\}/g)) {
+      const entry = item[1];
+      const id = entry.match(/\bid\s*:\s*(\d+)/i)?.[1];
+      const type = entry.match(/\btype\s*:\s*["']([^"']+)["']/i)?.[1];
+      if (id && type?.toLowerCase().startsWith('video/')) {
+        videos.push(`https://dl.bunkr.cr/file/${id}`);
+      }
+    }
+
+    return videos;
+  }
+
   async download(options: DownloadVideoOptions): Promise<DownloadedVideo> {
     if (isBunkrFileUrl(options.url)) {
       const fileUrl = await this.fetchBunkDownloaderPageUrl(options.url);
@@ -695,6 +732,10 @@ function isBunkrDownloaderPageUrl(url: string): boolean {
 
 function isBunkrFileUrl(url: string): boolean {
   return /^https?:\/\/(?:[a-z0-9-]+\.)*bunkr\.[a-z]{2,}\/f\//i.test(url);
+}
+
+function isBunkrAlbumUrl(url: string): boolean {
+  return /^https?:\/\/(?:[a-z0-9-]+\.)*bunkr\.[a-z]{2,}\/a\//i.test(url);
 }
 
 function extractBunkrFileId(url: string): string | undefined {

@@ -8,6 +8,7 @@ Bot ini menerima URL dari user, mencoba mengunduh videonya dengan `yt-dlp`, lalu
 - webhook-ready untuk deployment
 - download dengan `yt-dlp`
 - unduh Bunkr (`https://*.bunkr.*/file/<id>` atau `/f/<id>`) pakai custom downloader (detail API → sign token → media), dengan dukung progress & batalkan
+- URL album Bunkr (`/a/<id>`) otomatis diperluas menjadi bulk download video saja; gambar diabaikan
 - kirim kembali memakai `sendVideo` + `supports_streaming: true`
 - auto cleanup file sementara
 - auto split video yang melebihi batas upload menjadi beberapa part

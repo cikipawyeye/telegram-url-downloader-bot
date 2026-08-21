@@ -104,6 +104,23 @@ export class VideoMessageProcessor {
     convertToHeight?: number,
     signal?: AbortSignal,
   ): Promise<void> {
+    const expandedUrls: string[] = [];
+    for (const url of urls) {
+      try {
+        expandedUrls.push(...await this.videoDownloader.expandUrl(url));
+      } catch (error) {
+        console.error(`Failed to read bulk URL ${url}:`, error);
+        await notifier.updateStatus(acceptedMessage, `Gagal membaca album: ${url}`);
+      }
+    }
+
+    urls = expandedUrls;
+    if (urls.length === 0) {
+      this.pendingCancellations.delete(acceptedMessage.messageId);
+      await notifier.updateStatus(acceptedMessage, 'Tidak ada video yang ditemukan di input tersebut.');
+      return;
+    }
+
     const failed: string[] = [];
     let completed = 0;
 
