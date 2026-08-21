@@ -114,7 +114,7 @@ export class TelegramNotifier {
       media: new InputFile(screenshot.filePath, screenshot.fileName),
     }));
 
-    await this.bot.api.sendMediaGroup(this.getChatId(), media, { reply_parameters: this.replyParameters() });
+    await this.bot.api.sendMediaGroup(this.getChatId(), media);
   }
 
   async withMediaSendQueue<T>(task: () => Promise<T>): Promise<T> {
@@ -159,7 +159,7 @@ export class TelegramNotifier {
       })),
     ];
 
-    await this.bot.api.sendMediaGroup(this.getChatId(), media, { reply_parameters: this.replyParameters() });
+    await this.bot.api.sendMediaGroup(this.getChatId(), media);
   }
 
   canCombineScreenshotsWithVideo(screenshotsCount: number): boolean {
@@ -178,7 +178,6 @@ export class TelegramNotifier {
         thumbnail: video.thumbnail
           ? new InputFile(video.thumbnail.filePath, video.thumbnail.fileName)
           : undefined,
-        reply_parameters: this.replyParameters(),
       },
     );
   }
