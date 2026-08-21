@@ -114,6 +114,7 @@ export class VideoDownloader {
     const outputTemplate = path.join(outputDir, 'download.%(ext)s');
     const download = this.ytdlp.download(url, {
       format: VIDEO_FORMAT,
+      jsRuntime: `node:${process.execPath}`,
       mergeOutputFormat: 'mp4',
       noPlaylist: true,
       output: outputTemplate,
