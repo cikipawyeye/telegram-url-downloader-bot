@@ -20,6 +20,7 @@ export class TelegramNotifier {
   private static readonly mediaSendQueues = new Map<number, Promise<void>>();
   private readonly bot: Bot<Context>;
   private readonly ctx: Context;
+  private readonly replyToMessageId?: number;
   private readonly minProgressUpdateIntervalMs = 1500;
   private lastStatusText: string | null = null;
   private lastProgressUpdateAt = 0;
@@ -33,14 +34,17 @@ export class TelegramNotifier {
   constructor(ctx: Context, bot: Bot<Context>) {
     this.ctx = ctx;
     this.bot = bot;
+    this.replyToMessageId = ctx.message?.message_id;
   }
 
   async sendInvalidUrl(): Promise<void> {
-    await this.ctx.reply('Kirim URL yang valid ya.');
+    await this.ctx.reply('Kirim URL yang valid ya.', { reply_parameters: this.replyParameters() });
   }
 
   async sendAccepted(): Promise<StatusMessage> {
-    const message = await this.ctx.reply('Link diterima. Sedang mencoba mendownload video...');
+    const message = await this.ctx.reply('Link diterima. Sedang mencoba mendownload video...', {
+      reply_parameters: this.replyParameters(),
+    });
     this.lastStatusText = message.text;
     this.statusMessageClosed = false;
     this.stopButtonActive = false;
@@ -106,7 +110,7 @@ export class TelegramNotifier {
       media: new InputFile(screenshot.filePath, screenshot.fileName),
     }));
 
-    await this.bot.api.sendMediaGroup(this.getChatId(), media);
+    await this.bot.api.sendMediaGroup(this.getChatId(), media, { reply_parameters: this.replyParameters() });
   }
 
   async withMediaSendQueue<T>(task: () => Promise<T>): Promise<T> {
@@ -151,7 +155,7 @@ export class TelegramNotifier {
       })),
     ];
 
-    await this.bot.api.sendMediaGroup(this.getChatId(), media);
+    await this.bot.api.sendMediaGroup(this.getChatId(), media, { reply_parameters: this.replyParameters() });
   }
 
   canCombineScreenshotsWithVideo(screenshotsCount: number): boolean {
@@ -170,6 +174,7 @@ export class TelegramNotifier {
         thumbnail: video.thumbnail
           ? new InputFile(video.thumbnail.filePath, video.thumbnail.fileName)
           : undefined,
+        reply_parameters: this.replyParameters(),
       },
     );
   }
@@ -217,6 +222,10 @@ export class TelegramNotifier {
     }
 
     return chatId;
+  }
+
+  private replyParameters(): { message_id: number } | undefined {
+    return this.replyToMessageId === undefined ? undefined : { message_id: this.replyToMessageId };
   }
 
   private async flushPendingProgress(statusMessage: StatusMessage): Promise<void> {
