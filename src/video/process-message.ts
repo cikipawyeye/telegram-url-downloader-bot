@@ -250,6 +250,11 @@ export class VideoMessageProcessor {
         await notifier.confirmStopped(acceptedMessage);
       } else {
         const message = error instanceof Error ? error.message : 'Terjadi error.';
+        try {
+          await notifier.removeDownloadStopButton(acceptedMessage);
+        } catch (buttonError) {
+          console.error('Failed to remove download stop button:', buttonError);
+        }
         await notifier.updateStatus(acceptedMessage, `Gagal memproses link.\n${message}`);
       }
     } finally {
