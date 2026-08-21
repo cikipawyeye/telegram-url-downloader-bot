@@ -7,6 +7,8 @@ const TELEGRAM_THUMBNAIL_FILE_NAME = 'thumbnail.jpg';
 const TELEGRAM_THUMBNAIL_MAX_BYTES = 200 * 1024;
 const TELEGRAM_THUMBNAIL_MAX_DIMENSION = 320;
 const TELEGRAM_THUMBNAIL_QUALITY_VALUES = [4, 8, 12, 16, 20, 24, 28, 31];
+// Convert non-square source pixels to real image dimensions before Telegram sees the JPG.
+const NORMALIZE_PIXEL_ASPECT_FILTER = 'scale=trunc(iw*sar/2)*2:ih,setsar=1';
 
 export type GenerateScreenshotsOptions = {
   videoPath: string;
@@ -119,6 +121,8 @@ export class VideoScreenshotGenerator {
         options.videoPath,
         '-frames:v',
         '1',
+        '-vf',
+        NORMALIZE_PIXEL_ASPECT_FILTER,
         '-q:v',
         '2',
         options.filePath,
@@ -158,7 +162,7 @@ export class VideoScreenshotGenerator {
           '-frames:v',
           '1',
           '-vf',
-          `scale=${TELEGRAM_THUMBNAIL_MAX_DIMENSION}:${TELEGRAM_THUMBNAIL_MAX_DIMENSION}:force_original_aspect_ratio=decrease`,
+          `${NORMALIZE_PIXEL_ASPECT_FILTER},scale=${TELEGRAM_THUMBNAIL_MAX_DIMENSION}:${TELEGRAM_THUMBNAIL_MAX_DIMENSION}:force_original_aspect_ratio=decrease`,
           '-q:v',
           String(quality),
           options.filePath,
