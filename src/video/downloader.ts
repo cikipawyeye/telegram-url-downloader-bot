@@ -15,6 +15,7 @@ const BUNKR_REFERER = 'https://dl.bunkr.cr/';
 // (possibly much larger) download timeout.
 const BUNKR_API_TIMEOUT_MS = 30_000;
 const BUNKR_ERROR_BODY_LIMIT = 64 * 1024;
+const BUNKR_ALBUM_BODY_LIMIT = 8 * 1024 * 1024;
 
 // Bunkr/Cloudflare can reject requests that look like a bot. Use the exact
 // browser header set captured from the official site (sec-ch-*, user-agent, etc.)
@@ -118,6 +119,7 @@ export class VideoDownloader {
       { ...BUNKR_BROWSER_HEADERS, accept: 'text/html,application/xhtml+xml' },
       undefined,
       BUNKR_API_TIMEOUT_MS,
+      BUNKR_ALBUM_BODY_LIMIT,
     );
 
     if (status < 200 || status >= 300) {
@@ -295,6 +297,7 @@ export class VideoDownloader {
     headers: Record<string, string>,
     body: string | undefined,
     timeoutMs: number,
+    bodyLimit = BUNKR_ERROR_BODY_LIMIT,
   ): Promise<{ status: number; text: string }> {
     const controller = new AbortController();
     let timedOut = false;
@@ -306,7 +309,7 @@ export class VideoDownloader {
 
     try {
       const response = await this.bunkRawRequest(new URL(url), method, headers, body, controller.signal);
-      const text = await readResponseBody(response).catch(() => '');
+      const text = await readResponseBody(response, bodyLimit).catch(() => '');
       return { status: response.statusCode ?? 0, text };
     } catch (error) {
       throw this.mapBunkHttpError(error, timedOut, url, timeoutMs);
@@ -767,11 +770,11 @@ function parseContentLength(value: string | null): number | undefined {
   return Number.isFinite(number) && number > 0 ? number : undefined;
 }
 
-async function readResponseBody(response: IncomingMessage): Promise<string> {
+async function readResponseBody(response: IncomingMessage, limit = BUNKR_ERROR_BODY_LIMIT): Promise<string> {
   let text = '';
   for await (const chunk of response) {
     text += chunk;
-    if (text.length >= BUNKR_ERROR_BODY_LIMIT) {
+    if (text.length >= limit) {
       break;
     }
   }
