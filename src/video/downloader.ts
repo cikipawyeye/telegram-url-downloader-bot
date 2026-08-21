@@ -107,6 +107,11 @@ export class VideoDownloader {
 
   async download(options: DownloadVideoOptions): Promise<DownloadedVideo> {
     if (isBunkrFileUrl(options.url)) {
+      const fileUrl = await this.fetchBunkDownloaderPageUrl(options.url);
+      return await this.download({ ...options, url: fileUrl });
+    }
+
+    if (isBunkrDownloaderPageUrl(options.url)) {
       return await this.downloadFromBunk(options);
     }
 
@@ -130,6 +135,27 @@ export class VideoDownloader {
 
     const result = await this.runWithTimeout(download, signal);
     return await this.resolveDownloadedVideo(result, outputDir);
+  }
+
+  private async fetchBunkDownloaderPageUrl(url: string): Promise<string> {
+    const { status, text } = await this.requestBunkText(
+      url,
+      'GET',
+      { ...BUNKR_BROWSER_HEADERS, accept: 'text/html,application/xhtml+xml' },
+      undefined,
+      BUNKR_API_TIMEOUT_MS,
+    );
+
+    if (status < 200 || status >= 300) {
+      throw new Error(`Bunk halaman merespons HTTP ${status}.`);
+    }
+
+    const match = text.match(/href\s*=\s*["'](https:\/\/dl\.bunkr\.cr\/file\/[^"'\s?#]+(?:\?[^"'\s]*)?)["']/i);
+    if (!match) {
+      throw new Error('Link file Bunk tidak ditemukan di halaman tersebut.');
+    }
+
+    return match[1].replace(/&amp;/g, '&');
   }
 
   private async downloadFromBunk({ onProgress, outputDir, signal, url }: DownloadVideoOptions): Promise<DownloadedVideo> {
@@ -663,8 +689,12 @@ function mapProgress(progress: YtDlpVideoProgress): VideoDownloadProgress {
   };
 }
 
-function isBunkrFileUrl(url: string): boolean {
+function isBunkrDownloaderPageUrl(url: string): boolean {
   return /^https?:\/\/(?:[a-z0-9-]+\.)*bunkr\.[a-z]{2,}\/file\//i.test(url);
+}
+
+function isBunkrFileUrl(url: string): boolean {
+  return /^https?:\/\/(?:[a-z0-9-]+\.)*bunkr\.[a-z]{2,}\/f\//i.test(url);
 }
 
 function extractBunkrFileId(url: string): string | undefined {
