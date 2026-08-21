@@ -17,6 +17,7 @@ export type OutboundVideo = {
 const MEDIA_GROUP_MAX_ITEMS = 10;
 
 export class TelegramNotifier {
+  private static readonly mediaSendQueues = new Map<number, Promise<void>>();
   private readonly bot: Bot<Context>;
   private readonly ctx: Context;
   private readonly minProgressUpdateIntervalMs = 1500;
@@ -106,6 +107,22 @@ export class TelegramNotifier {
     }));
 
     await this.bot.api.sendMediaGroup(this.getChatId(), media);
+  }
+
+  async withMediaSendQueue<T>(task: () => Promise<T>): Promise<T> {
+    const chatId = this.getChatId();
+    const previous = TelegramNotifier.mediaSendQueues.get(chatId) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(task);
+    const queueEntry = current.then(() => undefined, () => undefined);
+    TelegramNotifier.mediaSendQueues.set(chatId, queueEntry);
+
+    try {
+      return await current;
+    } finally {
+      if (TelegramNotifier.mediaSendQueues.get(chatId) === queueEntry) {
+        TelegramNotifier.mediaSendQueues.delete(chatId);
+      }
+    }
   }
 
   async sendVideoWithScreenshots(screenshots: VideoScreenshot[], video: OutboundVideo): Promise<void> {

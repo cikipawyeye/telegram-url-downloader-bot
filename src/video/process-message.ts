@@ -185,38 +185,24 @@ export class VideoMessageProcessor {
         notifier.canCombineScreenshotsWithVideo(screenshots.length) &&
         segments.length === 1;
 
-      if (shouldCombine) {
-        const segment = segments[0];
+      await notifier.withMediaSendQueue(async () => {
+        if (shouldCombine) {
+          const segment = segments[0];
+          await notifier.updateStatus(acceptedMessage, 'Screenshot & video siap. Sedang mengirim ke Telegram dalam satu album...');
+          await notifier.sendVideoWithScreenshots(screenshots, {
+            filePath: segment.filePath,
+            fileName: buildDeliveryFileName(segment.filePath, video.title),
+            caption: truncateCaption(video.title),
+            width: video.width,
+            height: video.height,
+          });
+          return;
+        }
 
-        await notifier.updateStatus(
-          acceptedMessage,
-          'Screenshot & video siap. Sedang mengirim ke Telegram dalam satu album...',
-        );
-
-        await notifier.sendVideoWithScreenshots(screenshots, {
-          filePath: segment.filePath,
-          fileName: buildDeliveryFileName(segment.filePath, video.title),
-          caption: truncateCaption(video.title),
-          width: video.width,
-          height: video.height,
-        });
-      } else {
         if (screenshots.length > 0) {
-          await notifier.updateStatus(
-            acceptedMessage,
-            'Screenshot selesai. Sedang mengirim screenshot ke Telegram...',
-          );
-
+          await notifier.updateStatus(acceptedMessage, 'Screenshot selesai. Sedang mengirim screenshot ke Telegram...');
           await notifier.sendScreenshots(screenshots);
         }
-
-        if (segments.length > 1) {
-          await notifier.updateStatus(
-            acceptedMessage,
-            `Video berhasil dipecah menjadi ${segments.length} part. Sedang mengirim ke Telegram...`,
-          );
-        }
-
         for (const segment of segments) {
           await notifier.updateStatus(
             acceptedMessage,
@@ -224,7 +210,6 @@ export class VideoMessageProcessor {
               ? `Sedang mengirim video part ${segment.index}/${segment.total} ke Telegram...`
               : 'Sedang mengirim video ke Telegram...',
           );
-
           await notifier.sendVideo({
             filePath: segment.filePath,
             fileName: segments.length > 1
@@ -238,7 +223,7 @@ export class VideoMessageProcessor {
             height: video.height,
           });
         }
-      }
+      });
 
       try {
         await notifier.deleteStatus(acceptedMessage);
