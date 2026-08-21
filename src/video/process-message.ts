@@ -118,6 +118,7 @@ export class VideoMessageProcessor {
     if (urls.length === 0) {
       this.pendingCancellations.delete(acceptedMessage.messageId);
       await notifier.updateStatus(acceptedMessage, 'Tidak ada video yang ditemukan di input tersebut.');
+      this.pendingCancellations.delete(acceptedMessage.messageId);
       return;
     }
 
