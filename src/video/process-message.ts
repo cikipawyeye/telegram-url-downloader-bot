@@ -105,19 +105,24 @@ export class VideoMessageProcessor {
     signal?: AbortSignal,
   ): Promise<void> {
     const expandedUrls: string[] = [];
+    const expansionErrors: string[] = [];
     for (const url of urls) {
       try {
         expandedUrls.push(...await this.videoDownloader.expandUrl(url));
       } catch (error) {
         console.error(`Failed to read bulk URL ${url}:`, error);
-        await notifier.updateStatus(acceptedMessage, `Gagal membaca album: ${url}`);
+        const reason = error instanceof Error ? error.message : String(error);
+        expansionErrors.push(`${url}: ${reason}`);
       }
     }
 
     urls = expandedUrls;
     if (urls.length === 0) {
       this.pendingCancellations.delete(acceptedMessage.messageId);
-      await notifier.updateStatus(acceptedMessage, 'Tidak ada video yang ditemukan di input tersebut.');
+      const message = expansionErrors.length > 0
+        ? `Gagal membaca video dari input tersebut:\n${expansionErrors.join('\n')}`
+        : 'Album berhasil dibaca, tetapi tidak berisi video.';
+      await notifier.updateStatus(acceptedMessage, message);
       this.pendingCancellations.delete(acceptedMessage.messageId);
       return;
     }
