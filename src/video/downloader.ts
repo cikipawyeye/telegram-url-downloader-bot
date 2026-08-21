@@ -59,11 +59,9 @@ const BUNKR_HTTPS_AGENT = new https.Agent({
   maxSockets: 16,
 });
 
-// Pick a single progressive file that already contains both audio and video.
-// This avoids yt-dlp downloading separate video+audio streams and then merging
-// them (which could need 3-4x the final size on disk). All fallbacks below
-// select ONE file, so no `+` selector is used and no merge ever happens.
-const SINGLE_FILE_VIDEO_FORMAT = 'best[ext=mp4][vcodec^=avc1][acodec^=mp4a]/best[ext=mp4]/best';
+// Prefer a progressive MP4, but fall back to separate streams when YouTube
+// does not provide a suitable single file.
+const VIDEO_FORMAT = 'best[ext=mp4][vcodec^=avc1][acodec^=mp4a]/bestvideo+bestaudio/best';
 const METADATA_PROBE_TIMEOUT_MS = 30_000;
 
 export class DownloadCancelledError extends Error {
@@ -115,8 +113,7 @@ export class VideoDownloader {
     const { onProgress, outputDir, signal, url } = options;
     const outputTemplate = path.join(outputDir, 'download.%(ext)s');
     const download = this.ytdlp.download(url, {
-      format: SINGLE_FILE_VIDEO_FORMAT,
-      jsRuntime: '',
+      format: VIDEO_FORMAT,
       mergeOutputFormat: 'mp4',
       noPlaylist: true,
       output: outputTemplate,
