@@ -248,8 +248,6 @@ export class VideoMessageProcessor {
             filePath: segment.filePath,
             fileName: buildDeliveryFileName(segment.filePath, video.title),
             caption: truncateCaption(video.title),
-            width: video.width,
-            height: video.height,
           });
           return;
         }
@@ -274,8 +272,6 @@ export class VideoMessageProcessor {
               ? buildPartCaption(video.title, segment.index, segment.total)
               : truncateCaption(video.title),
             thumbnail,
-            width: video.width,
-            height: video.height,
           });
         }
     });
