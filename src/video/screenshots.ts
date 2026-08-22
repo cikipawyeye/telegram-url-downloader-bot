@@ -14,7 +14,7 @@ const TELEGRAM_THUMBNAIL_QUALITY_VALUES = [4, 8, 12, 16, 20, 24, 28, 31];
  * running this unconditionally would rescale every frame (e.g. SAR 9:16 on a
  * 1080x1080 stream produces a 6075x1080 frame) and burn CPU for nothing.
  */
-function buildPixelAspectFilter(sar: string | undefined): string | undefined {
+export function buildPixelAspectFilter(sar: string | undefined): string | undefined {
   if (!sar || sar === 'N/A' || sar === '0:1' || sar === '1:1') {
     return undefined;
   }

@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { DownloadCancelledError } from './downloader.js';
+import { buildPixelAspectFilter } from './screenshots.js';
 import type { DownloadedVideo } from './utils.js';
 
 export type ConvertedVideo = DownloadedVideo & {
@@ -63,6 +64,14 @@ export class VideoConverter {
       scaleFilter = `scale=-2:min(${effectiveTargetHeight}\\,ih)`;
     }
 
+    // Non-square source pixels (anamorphic) must be baked into real dimensions
+    // before scaling, otherwise Telegram clients ignore the SAR tag and show
+    // the video stretched.
+    const aspectFilter = buildPixelAspectFilter(
+      await this.probeSampleAspectRatio(options.video.filePath),
+    );
+    const videoFilter = [aspectFilter, scaleFilter].filter(Boolean).join(',');
+
     const outputFilePath = path.join(options.outputDir, 'converted.mp4');
 
     await this.runCommand('ffmpeg', [
@@ -78,7 +87,7 @@ export class VideoConverter {
       '-map',
       '0:a:0?',
       '-vf',
-      scaleFilter,
+      videoFilter,
       '-c:v',
       'libx264',
       '-preset',
@@ -138,6 +147,34 @@ export class VideoConverter {
     } catch (error) {
       console.error('Failed to parse converted video dimensions:', error);
       return { width: 0, height: 0 };
+    }
+  }
+
+  private async probeSampleAspectRatio(videoPath: string): Promise<string | undefined> {
+    let output: string;
+    try {
+      output = await this.runCommand('ffprobe', [
+        '-v',
+        'error',
+        '-select_streams',
+        'v:0',
+        '-show_entries',
+        'stream=sample_aspect_ratio',
+        '-of',
+        'json',
+        videoPath,
+      ]);
+    } catch {
+      return undefined;
+    }
+
+    try {
+      const parsed = JSON.parse(output) as {
+        streams?: Array<{ sample_aspect_ratio?: string }>;
+      };
+      return parsed.streams?.[0]?.sample_aspect_ratio;
+    } catch {
+      return undefined;
     }
   }
 
