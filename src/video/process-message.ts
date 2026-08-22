@@ -17,6 +17,9 @@ export type ProcessVideoMessageRequest = {
 };
 
 export class VideoMessageProcessor {
+  /** FIFO per chat; serializes whole concurrent batches so cross-batch media order is stable. */
+  private static readonly batchQueues = new Map<number, Promise<void>>();
+
   private readonly maxFileSizeBytes: number;
   private readonly videoDownloader: VideoDownloader;
   private readonly videoScreenshotGenerator: VideoScreenshotGenerator;
@@ -94,7 +97,7 @@ export class VideoMessageProcessor {
         `stop:download:${acceptedMessage.messageId}`,
       );
 
-      void this.processBatch(
+      void this.enqueueBatch(
         notifier,
         acceptedMessage,
         urls,
@@ -106,6 +109,41 @@ export class VideoMessageProcessor {
     } catch (error) {
       throw error;
     }
+  }
+
+  private enqueueBatch(
+    notifier: TelegramNotifier,
+    acceptedMessage: StatusMessage,
+    urls: string[],
+    userId: string,
+    convertToHeight?: number,
+    signal?: AbortSignal,
+    jobId?: number,
+  ): Promise<void> {
+    const chatId = notifier.chatId;
+    const previous = VideoMessageProcessor.batchQueues.get(chatId) ?? Promise.resolve();
+    const current = previous
+      .catch(() => undefined)
+      .then(() =>
+        this.processBatch(
+          notifier,
+          acceptedMessage,
+          urls,
+          userId,
+          convertToHeight,
+          signal,
+          jobId,
+        ),
+      );
+    // Reflect the final settled state in the map regardless of failure, so the
+    // next batch for this chat is never blocked by a rejected queue entry.
+    const queueEntry = current.then(
+      () => undefined,
+      () => undefined,
+    );
+    VideoMessageProcessor.batchQueues.set(chatId, queueEntry);
+
+    return current;
   }
 
   private async processBatch(
