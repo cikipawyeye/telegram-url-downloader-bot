@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   bot:
     build: .
@@ -11,6 +9,19 @@ services:
       - "${PORT:-3000}:3000"
     volumes:
       - bot_tmp:${DOWNLOAD_DIR:-/tmp/telegram-video-bot}
+  tg-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: tg-bot-api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${TG_BOT_API_PORT:-8081}:8081"
+    environment:
+      TELEGRAM_API_ID: "${TELEGRAM_API_ID}"
+      TELEGRAM_API_HASH: "${TELEGRAM_API_HASH}"
+      TELEGRAM_LOCAL: "1"
+    volumes:
+      - tg_bot_api_data:/var/lib/telegram-bot-api
 
 volumes:
   bot_tmp:
+  tg_bot_api_data:
