@@ -37,6 +37,11 @@ export class TelegramNotifier {
     this.replyToMessageId = ctx.message?.message_id;
   }
 
+  /** Chat the notifier is bound to; needed for job bookkeeping. */
+  get chatId(): number {
+    return this.getChatId();
+  }
+
   async sendInvalidUrl(): Promise<void> {
     await this.ctx.reply('Kirim URL yang valid ya.', { reply_parameters: this.replyParameters() });
   }

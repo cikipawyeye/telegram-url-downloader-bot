@@ -1,4 +1,5 @@
 import { InlineKeyboard, type Bot, type Context } from 'grammy';
+import type { BotDatabase } from '../storage/database.js';
 import { TelegramNotifier } from './notifier.js';
 import type { VideoMessageProcessor } from '../video/process-message.js';
 
@@ -47,20 +48,15 @@ function buildPendingKeyboard(): InlineKeyboard {
     .text('❌ Batal', 'convert:cancel');
 }
 
-type PendingConversion = {
-  height: number;
-  messageId: number;
-};
-
-// In-memory pending conversion per chat, along with the id of the instruction
-// message so its inline buttons can be removed once a URL is sent.
-const pendingConversions = new Map<number, PendingConversion>();
-
 export function registerBotHandlers(
   bot: Bot<Context>,
   videoMessageProcessor: VideoMessageProcessor,
+  db: BotDatabase,
 ): void {
   bot.command('start', async (ctx) => {
+    db.touchUser(ctx.from ?? {});
+    db.touchChat(ctx.chat ?? {});
+
     await ctx.reply(
       [
         'Kirim link video ke bot ini.',
@@ -75,10 +71,16 @@ export function registerBotHandlers(
   });
 
   bot.command('help', async (ctx) => {
+    db.touchUser(ctx.from ?? {});
+    db.touchChat(ctx.chat ?? {});
+
     await ctx.reply(HELP_TEXT);
   });
 
   bot.command('convert', async (ctx) => {
+    db.touchUser(ctx.from ?? {});
+    db.touchChat(ctx.chat ?? {});
+
     await ctx.reply(RESOLUTION_MENU_TEXT, {
       reply_markup: buildResolutionKeyboard(),
     });
@@ -91,6 +93,9 @@ export function registerBotHandlers(
     if (stopMatch) {
       const statusMessageId = Number(stopMatch[1]);
       const cancelled = videoMessageProcessor.cancelDownload(statusMessageId);
+      // Record the request even when the in-memory entry is gone (e.g. after a
+      // restart) so the job row reflects what the user asked for.
+      db.requestCancelByStatusMessage(statusMessageId);
       await ctx.answerCallbackQuery(cancelled ? 'Menghentikan unduhan...' : 'Tidak ada proses yang sedang berjalan.');
       return;
     }
@@ -103,7 +108,7 @@ export function registerBotHandlers(
       const messageId = ctx.callbackQuery.message?.message_id;
 
       if (chatId !== undefined && messageId !== undefined) {
-        pendingConversions.set(chatId, { height, messageId });
+        db.setPendingConversion(chatId, messageId, height);
       }
 
       await ctx.answerCallbackQuery();
@@ -122,7 +127,7 @@ export function registerBotHandlers(
       const chatId = ctx.chat?.id;
 
       if (chatId !== undefined) {
-        pendingConversions.delete(chatId);
+        db.deletePendingConversion(chatId);
       }
 
       await ctx.answerCallbackQuery();
@@ -136,7 +141,7 @@ export function registerBotHandlers(
       const chatId = ctx.chat?.id;
 
       if (chatId !== undefined) {
-        pendingConversions.delete(chatId);
+        db.deletePendingConversion(chatId);
       }
 
       await ctx.answerCallbackQuery();
@@ -150,14 +155,17 @@ export function registerBotHandlers(
   });
 
   bot.on('message:text', async (ctx) => {
+    db.touchUser(ctx.from ?? {});
+    db.touchChat(ctx.chat ?? {});
+
     const chatId = ctx.chat?.id;
-    const pending = chatId !== undefined ? pendingConversions.get(chatId) : undefined;
+    const pending = chatId !== undefined ? db.getPendingConversion(chatId) : undefined;
     const hasUrl = URL_PATTERN.test(ctx.message.text);
 
     if (pending && hasUrl && chatId !== undefined) {
       // Consume the pending conversion and remove the instruction message's
       // inline buttons ("Batal" / "Pilih resolusi lain").
-      pendingConversions.delete(chatId);
+      db.deletePendingConversion(chatId);
 
       try {
         await ctx.api.editMessageText(

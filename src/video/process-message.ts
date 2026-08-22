@@ -1,4 +1,5 @@
 import type { WorkspaceManager } from '../storage/workspace.js';
+import type { BotDatabase } from '../storage/database.js';
 import type { StatusMessage } from '../telegram/notifier.js';
 import type { TelegramNotifier } from '../telegram/notifier.js';
 import { buildDeliveryFileName, buildDeliveryPartFileName, buildPartCaption, extractUrls, formatBytes, formatDownloadProgress, truncateCaption, type VideoDownloadProgress, type VideoThumbnail } from './utils.js';
@@ -22,6 +23,7 @@ export class VideoMessageProcessor {
   private readonly videoSplitter: VideoSplitter;
   private readonly videoConverter: VideoConverter;
   private readonly workspaceManager: WorkspaceManager;
+  private readonly db?: BotDatabase;
   private readonly screenshotCount: number;
   private readonly sendVideoInAlbum: boolean;
   private readonly pendingCancellations = new Map<number, AbortController>();
@@ -35,6 +37,7 @@ export class VideoMessageProcessor {
     workspaceManager: WorkspaceManager;
     screenshotCount: number;
     sendVideoInAlbum: boolean;
+    db?: BotDatabase;
   }) {
     this.maxFileSizeBytes = options.maxFileSizeBytes;
     this.videoDownloader = options.videoDownloader;
@@ -44,6 +47,7 @@ export class VideoMessageProcessor {
     this.workspaceManager = options.workspaceManager;
     this.screenshotCount = options.screenshotCount;
     this.sendVideoInAlbum = options.sendVideoInAlbum;
+    this.db = options.db;
   }
 
   cancelDownload(statusMessageId: number): boolean {
@@ -78,6 +82,13 @@ export class VideoMessageProcessor {
       const controller = new AbortController();
       this.pendingCancellations.set(acceptedMessage.messageId, controller);
 
+      const jobId = this.db?.createJob({
+        chatId: notifier.chatId,
+        userId: Number(userId) || undefined,
+        statusMessageId: acceptedMessage.messageId,
+        convertHeight: convertToHeight,
+      });
+
       await notifier.addDownloadStopButton(
         acceptedMessage,
         `stop:download:${acceptedMessage.messageId}`,
@@ -90,6 +101,7 @@ export class VideoMessageProcessor {
         userId,
         convertToHeight,
         controller.signal,
+        jobId,
       );
     } catch (error) {
       throw error;
@@ -103,6 +115,7 @@ export class VideoMessageProcessor {
     userId: string,
     convertToHeight?: number,
     signal?: AbortSignal,
+    jobId?: number,
   ): Promise<void> {
     const expandedUrls: string[] = [];
     const expansionErrors: string[] = [];
@@ -119,12 +132,20 @@ export class VideoMessageProcessor {
     urls = expandedUrls;
     if (urls.length === 0) {
       this.pendingCancellations.delete(acceptedMessage.messageId);
+      if (jobId !== undefined) {
+        this.db?.setJobTotalUrls(jobId, 0);
+        this.db?.finishJob(jobId, 'failed');
+      }
       const message = expansionErrors.length > 0
         ? `Gagal membaca video dari input tersebut:\n${expansionErrors.join('\n')}`
         : 'Album berhasil dibaca, tetapi tidak berisi video.';
       await notifier.updateStatus(acceptedMessage, message);
       this.pendingCancellations.delete(acceptedMessage.messageId);
       return;
+    }
+
+    if (jobId !== undefined) {
+      this.db?.setJobTotalUrls(jobId, urls.length);
     }
 
     const failed: string[] = [];
@@ -140,6 +161,11 @@ export class VideoMessageProcessor {
       const workspace = await this.workspaceManager.create(userId);
       await notifier.updateStatus(acceptedMessage, `Selesai ${completed}/${urls.length}. Memproses ${index + 1}/${urls.length}...`);
 
+      let itemId: number | undefined;
+      if (jobId !== undefined) {
+        itemId = this.db?.addItem(jobId, url);
+      }
+
       try {
         const video = await this.videoDownloader.download({
           url,
@@ -151,13 +177,23 @@ export class VideoMessageProcessor {
         });
         await this.processDownloadedVideo(notifier, acceptedMessage, workspace.dirPath, video, convertToHeight, signal);
         completed += 1;
+        if (itemId !== undefined) {
+          this.db?.completeItem(itemId, video);
+        }
       } catch (error) {
         if (error instanceof DownloadCancelledError) {
+          if (jobId !== undefined) {
+            this.db?.cancelItems(jobId);
+            this.db?.finishJob(jobId, 'cancelled');
+          }
           await notifier.confirmStopped(acceptedMessage);
           return;
         }
         failed.push(url);
         console.error(`Failed to process bulk URL ${url}:`, error);
+        if (itemId !== undefined) {
+          this.db?.failItem(itemId, error instanceof Error ? error.message : String(error));
+        }
         await notifier.updateStatus(acceptedMessage, `Link ${index + 1}/${urls.length} gagal. Lanjut ke link berikutnya...`);
       } finally {
         await this.workspaceManager.remove(workspace);

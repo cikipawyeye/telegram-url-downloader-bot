@@ -1,3 +1,5 @@
+import path from 'node:path';
+
 export type AppConfig = {
   port: number;
   botToken: string;
@@ -5,6 +7,7 @@ export type AppConfig = {
   webhookSecret: string;
   telegramApiRoot?: string;
   downloadDir: string;
+  dbPath: string;
   maxFileSizeBytes: number;
   downloadTimeoutMs: number;
   ytdlpProxy?: string;
@@ -36,6 +39,7 @@ export function loadConfig(): AppConfig {
     webhookSecret,
     telegramApiRoot: process.env.TELEGRAM_API_ROOT || undefined,
     downloadDir: process.env.DOWNLOAD_DIR ?? '/tmp/telegram-video-bot',
+    dbPath: process.env.DB_PATH ?? path.join(process.env.DOWNLOAD_DIR ?? '/tmp/telegram-video-bot', 'bot.db'),
     maxFileSizeBytes: Number(process.env.MAX_FILE_SIZE_BYTES ?? 2147483648),
     downloadTimeoutMs: Number(process.env.DOWNLOAD_TIMEOUT_MS ?? 900000),
     ytdlpProxy: process.env.YTDLP_PROXY || undefined,

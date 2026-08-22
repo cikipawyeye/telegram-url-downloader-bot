@@ -4,6 +4,7 @@ import { Bot, type Context, webhookCallback } from 'grammy';
 import { YtDlp } from 'ytdlp-nodejs';
 import { loadConfig } from './config.js';
 import { createHttpApp } from './http/create-app.js';
+import { BotDatabase } from './storage/database.js';
 import { WorkspaceManager } from './storage/workspace.js';
 import { registerBotHandlers, BOT_COMMANDS } from './telegram/register-handlers.js';
 import { VideoDownloader } from './video/downloader.js';
@@ -29,6 +30,8 @@ async function bootstrap(): Promise<void> {
   await workspaceManager.prepareRoot();
   workspaceManager.startAutoSweep();
 
+  const db = new BotDatabase(config.dbPath);
+
   const videoMessageProcessor = new VideoMessageProcessor({
     maxFileSizeBytes: config.maxFileSizeBytes,
     videoDownloader: new VideoDownloader({
@@ -48,9 +51,10 @@ async function bootstrap(): Promise<void> {
     workspaceManager,
     screenshotCount: config.screenshotCount,
     sendVideoInAlbum: config.sendVideoInAlbum,
+    db,
   });
 
-  registerBotHandlers(bot, videoMessageProcessor);
+  registerBotHandlers(bot, videoMessageProcessor, db);
 
   const app = createHttpApp(config.downloadDir);
   const webhookPath = `/telegram/webhook/${config.webhookSecret}`;
@@ -81,6 +85,7 @@ async function bootstrap(): Promise<void> {
         console.error('Failed to delete webhook:', error);
       }
 
+      db.close();
       process.exit(0);
     });
   };
