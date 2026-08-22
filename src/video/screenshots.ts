@@ -7,8 +7,20 @@ const TELEGRAM_THUMBNAIL_FILE_NAME = 'thumbnail.jpg';
 const TELEGRAM_THUMBNAIL_MAX_BYTES = 200 * 1024;
 const TELEGRAM_THUMBNAIL_MAX_DIMENSION = 320;
 const TELEGRAM_THUMBNAIL_QUALITY_VALUES = [4, 8, 12, 16, 20, 24, 28, 31];
-// Convert non-square source pixels to real image dimensions before Telegram sees the JPG.
-const NORMALIZE_PIXEL_ASPECT_FILTER = 'scale=trunc(iw*sar/2)*2:ih,setsar=1';
+
+/**
+ * Convert non-square source pixels to real image dimensions before Telegram
+ * sees the JPG. Only applied when the stream actually has a non-square SAR —
+ * running this unconditionally would rescale every frame (e.g. SAR 9:16 on a
+ * 1080x1080 stream produces a 6075x1080 frame) and burn CPU for nothing.
+ */
+function buildPixelAspectFilter(sar: string | undefined): string | undefined {
+  if (!sar || sar === 'N/A' || sar === '0:1' || sar === '1:1') {
+    return undefined;
+  }
+
+  return 'scale=trunc(iw*sar/2)*2:ih,setsar=1';
+}
 
 export type GenerateScreenshotsOptions = {
   videoPath: string;
@@ -39,17 +51,24 @@ export class VideoScreenshotGenerator {
     const screenshotsDir = path.join(outputDir, 'screenshots');
     await fsp.mkdir(screenshotsDir, { recursive: true });
 
+    const mediaInfo = await this.probeMediaInfo(videoPath);
     const resolvedDurationSeconds =
       durationSeconds !== undefined && durationSeconds > 0
         ? durationSeconds
-        : await this.probeDuration(videoPath);
+        : mediaInfo.durationSeconds ?? 0;
 
+    if (!(resolvedDurationSeconds > 0)) {
+      throw new Error('Durasi video tidak dapat dibaca untuk membuat screenshot.');
+    }
+
+    const aspectFilter = buildPixelAspectFilter(mediaInfo.sampleAspectRatio);
     const screenshotPlan = buildScreenshotPlan(resolvedDurationSeconds, count);
     const screenshots: VideoScreenshot[] = [];
 
     for (const item of screenshotPlan) {
       const filePath = path.join(screenshotsDir, item.fileName);
       const captured = await this.captureScreenshot({
+        aspectFilter,
         durationSeconds: resolvedDurationSeconds,
         filePath,
         preferredCaptureSeconds: item.captureSeconds,
@@ -74,13 +93,20 @@ export class VideoScreenshotGenerator {
     outputDir,
     videoPath,
   }: GenerateThumbnailOptions): Promise<VideoThumbnail> {
+    await fsp.mkdir(outputDir, { recursive: true });
     const filePath = path.join(outputDir, TELEGRAM_THUMBNAIL_FILE_NAME);
+    const mediaInfo = await this.probeMediaInfo(videoPath);
     const resolvedDurationSeconds =
       durationSeconds !== undefined && durationSeconds > 0
         ? durationSeconds
-        : await this.probeDuration(videoPath);
+        : mediaInfo.durationSeconds ?? 0;
+
+    if (!(resolvedDurationSeconds > 0)) {
+      throw new Error('Durasi video tidak dapat dibaca untuk membuat thumbnail.');
+    }
 
     const captured = await this.captureThumbnail({
+      aspectFilter: buildPixelAspectFilter(mediaInfo.sampleAspectRatio),
       durationSeconds: resolvedDurationSeconds,
       filePath,
       preferredCaptureSeconds: resolvedDurationSeconds * 0.5,
@@ -98,6 +124,7 @@ export class VideoScreenshotGenerator {
   }
 
   private async captureScreenshot(options: {
+    aspectFilter?: string;
     durationSeconds: number;
     filePath: string;
     preferredCaptureSeconds: number;
@@ -121,8 +148,7 @@ export class VideoScreenshotGenerator {
         options.videoPath,
         '-frames:v',
         '1',
-        '-vf',
-        NORMALIZE_PIXEL_ASPECT_FILTER,
+        ...(options.aspectFilter ? ['-vf', options.aspectFilter] : []),
         '-q:v',
         '2',
         options.filePath,
@@ -137,6 +163,7 @@ export class VideoScreenshotGenerator {
   }
 
   private async captureThumbnail(options: {
+    aspectFilter?: string;
     durationSeconds: number;
     filePath: string;
     preferredCaptureSeconds: number;
@@ -146,35 +173,60 @@ export class VideoScreenshotGenerator {
       options.preferredCaptureSeconds,
       options.durationSeconds,
     );
+    const candidatePaths = TELEGRAM_THUMBNAIL_QUALITY_VALUES.map(
+      (quality) => `${options.filePath}.q${quality}.jpg`,
+    );
 
+    // One decode + scale produces every quality variant in a single ffmpeg
+    // process instead of re-decoding the frame once per quality value.
+    // ponytail: per-output `-update` needs ffmpeg >= 5.1; fall back to the
+    // one-command-per-quality loop if older builds ever matter.
     for (const captureSeconds of captureTimes) {
-      for (const quality of TELEGRAM_THUMBNAIL_QUALITY_VALUES) {
-        await fsp.rm(options.filePath, { force: true });
+      await fsp.rm(options.filePath, { force: true });
+      await Promise.all(candidatePaths.map((candidate) => fsp.rm(candidate, { force: true })));
 
-        await this.runCommand('ffmpeg', [
-          '-y',
-          '-loglevel',
-          'error',
-          '-ss',
-          captureSeconds.toFixed(3),
-          '-i',
-          options.videoPath,
-          '-frames:v',
-          '1',
-          '-vf',
-          `${NORMALIZE_PIXEL_ASPECT_FILTER},scale=${TELEGRAM_THUMBNAIL_MAX_DIMENSION}:${TELEGRAM_THUMBNAIL_MAX_DIMENSION}:force_original_aspect_ratio=decrease`,
-          '-q:v',
-          String(quality),
-          options.filePath,
-        ]);
+      const outputArgs = TELEGRAM_THUMBNAIL_QUALITY_VALUES.flatMap((quality, index) => [
+        '-map',
+        '0:v:0',
+        '-update',
+        '1',
+        '-frames:v',
+        '1',
+        '-q:v',
+        String(quality),
+        candidatePaths[index],
+      ]);
 
-        if (await fileExistsWithContent(options.filePath, TELEGRAM_THUMBNAIL_MAX_BYTES)) {
+      const videoFilter = [
+        options.aspectFilter,
+        `scale=${TELEGRAM_THUMBNAIL_MAX_DIMENSION}:${TELEGRAM_THUMBNAIL_MAX_DIMENSION}:force_original_aspect_ratio=decrease`,
+      ].filter(Boolean).join(',');
+
+      await this.runCommand('ffmpeg', [
+        '-y',
+        '-loglevel',
+        'error',
+        '-ss',
+        captureSeconds.toFixed(3),
+        '-i',
+        options.videoPath,
+        '-vf',
+        videoFilter,
+        ...outputArgs,
+      ]);
+
+      // Prefer the highest quality that fits Telegram's size cap.
+      for (const index of TELEGRAM_THUMBNAIL_QUALITY_VALUES.keys()) {
+        if (await fileExistsWithContent(candidatePaths[index], TELEGRAM_THUMBNAIL_MAX_BYTES)) {
+          await fsp.rename(candidatePaths[index], options.filePath);
+          await Promise.all(candidatePaths.map((candidate) => fsp.rm(candidate, { force: true })));
           return true;
         }
       }
     }
 
     await fsp.rm(options.filePath, { force: true });
+    await Promise.all(candidatePaths.map((candidate) => fsp.rm(candidate, { force: true })));
     return false;
   }
 
@@ -197,24 +249,39 @@ export class VideoScreenshotGenerator {
     )).map(Number);
   }
 
-  private async probeDuration(videoPath: string): Promise<number> {
+  private async probeMediaInfo(videoPath: string): Promise<{
+    durationSeconds?: number;
+    sampleAspectRatio?: string;
+  }> {
     const output = await this.runCommand('ffprobe', [
       '-v',
       'error',
+      '-select_streams',
+      'v:0',
       '-show_entries',
-      'format=duration',
+      'stream=sample_aspect_ratio:format=duration',
       '-of',
-      'default=noprint_wrappers=1:nokey=1',
+      'json',
       videoPath,
     ]);
 
-    const durationSeconds = Number(output.trim());
+    let parsed: {
+      streams?: Array<{ sample_aspect_ratio?: string }>;
+      format?: { duration?: string };
+    };
 
-    if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+    try {
+      parsed = JSON.parse(output);
+    } catch {
       throw new Error('Durasi video tidak dapat dibaca untuk membuat screenshot.');
     }
 
-    return durationSeconds;
+    const durationRaw = Number(parsed.format?.duration);
+
+    return {
+      durationSeconds: Number.isFinite(durationRaw) && durationRaw > 0 ? durationRaw : undefined,
+      sampleAspectRatio: parsed.streams?.[0]?.sample_aspect_ratio,
+    };
   }
 
   private async runCommand(command: string, args: string[]): Promise<string> {
