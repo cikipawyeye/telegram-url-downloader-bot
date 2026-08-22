@@ -212,6 +212,18 @@ export class TelegramNotifier {
     return new InlineKeyboard().text('⏹ Hentikan Unduhan', this.stopButtonCallbackData);
   }
 
+  private async editStatusMessage(messageId: number, text: string): Promise<void> {
+    try {
+      await this.bot.api.editMessageText(this.getChatId(), messageId, text, {
+        reply_markup: this.buildStatusKeyboard(),
+      });
+    } catch (error) {
+      if (!isMessageNotModifiedError(error)) {
+        throw error;
+      }
+    }
+  }
+
   private async editStatusText(messageId: number, text: string, replyMarkup: InlineKeyboard): Promise<void> {
     try {
       await this.bot.api.editMessageText(this.getChatId(), messageId, text, { reply_markup: replyMarkup });
@@ -276,13 +288,11 @@ export class TelegramNotifier {
         }
 
         try {
-          await this.bot.api.editMessageText(this.getChatId(), statusMessage.messageId, text, {
-            reply_markup: this.buildStatusKeyboard(),
-          });
+          await this.editStatusMessage(statusMessage.messageId, text);
         } catch (error) {
-          if (!isMessageNotModifiedError(error)) {
-            throw error;
-          }
+          // Status text is cosmetic; never fail the whole batch over it.
+          console.error('Failed to update status message:', error);
+          return;
         }
 
         this.lastStatusText = text;

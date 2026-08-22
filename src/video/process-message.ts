@@ -97,7 +97,9 @@ export class VideoMessageProcessor {
         `stop:download:${acceptedMessage.messageId}`,
       );
 
-      void this.enqueueBatch(
+      // Catch here: a rejecting batch must never become an unhandled
+      // rejection (it crashes the process and kills the stop button).
+      this.enqueueBatch(
         notifier,
         acceptedMessage,
         urls,
@@ -105,7 +107,21 @@ export class VideoMessageProcessor {
         convertToHeight,
         controller.signal,
         jobId,
-      );
+      ).catch(async (error) => {
+        console.error(`Batch failed for status message ${acceptedMessage.messageId}:`, error);
+
+        this.pendingCancellations.delete(acceptedMessage.messageId);
+        if (jobId !== undefined) {
+          this.db?.cancelItems(jobId);
+          this.db?.finishJob(jobId, 'failed');
+        }
+
+        const reason = error instanceof Error ? error.message : String(error);
+        await notifier.updateStatus(
+          acceptedMessage,
+          `Proses berhenti karena error. Kirim ulang link untuk melanjutkan.\n${reason.slice(0, 300)}`,
+        ).catch(() => undefined);
+      });
     } catch (error) {
       throw error;
     }
