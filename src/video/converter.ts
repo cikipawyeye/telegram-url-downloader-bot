@@ -30,7 +30,12 @@ export class VideoConverter {
   async convert(options: {
     video: DownloadedVideo;
     outputDir: string;
-    targetHeight: number;
+    /**
+     * Omit to only bake anamorphic (non-square) pixels into real dimensions
+     * without resizing — used when the user did not request a conversion but
+     * the source still needs a re-encode to look correct in Telegram.
+     */
+    targetHeight?: number;
     signal?: AbortSignal;
     onProgress?: (percent: number) => void;
   }): Promise<ConvertedVideo> {
@@ -49,19 +54,21 @@ export class VideoConverter {
       sourceHeight !== undefined &&
       sourceHeight > sourceWidth;
 
-    let scaleFilter: string;
-    if (isPortrait) {
-      const effectiveTargetWidth =
-        sourceWidth !== undefined && sourceWidth > 0
-          ? Math.min(options.targetHeight, sourceWidth)
-          : options.targetHeight;
-      scaleFilter = `scale=min(${effectiveTargetWidth}\\,iw):-2`;
-    } else {
-      const effectiveTargetHeight =
-        sourceHeight !== undefined && sourceHeight > 0
-          ? Math.min(options.targetHeight, sourceHeight)
-          : options.targetHeight;
-      scaleFilter = `scale=-2:min(${effectiveTargetHeight}\\,ih)`;
+    let scaleFilter: string | undefined;
+    if (options.targetHeight !== undefined) {
+      if (isPortrait) {
+        const effectiveTargetWidth =
+          sourceWidth !== undefined && sourceWidth > 0
+            ? Math.min(options.targetHeight, sourceWidth)
+            : options.targetHeight;
+        scaleFilter = `scale=min(${effectiveTargetWidth}\\,iw):-2`;
+      } else {
+        const effectiveTargetHeight =
+          sourceHeight !== undefined && sourceHeight > 0
+            ? Math.min(options.targetHeight, sourceHeight)
+            : options.targetHeight;
+        scaleFilter = `scale=-2:min(${effectiveTargetHeight}\\,ih)`;
+      }
     }
 
     // Non-square source pixels (anamorphic) must be baked into real dimensions
@@ -71,6 +78,9 @@ export class VideoConverter {
       await this.probeSampleAspectRatio(options.video.filePath),
     );
     const videoFilter = [aspectFilter, scaleFilter].filter(Boolean).join(',');
+    if (!videoFilter) {
+      throw new Error('Konversi dipanggil tanpa filter: butuh targetHeight atau SAR non-square.');
+    }
 
     const outputFilePath = path.join(options.outputDir, 'converted.mp4');
 
@@ -150,7 +160,7 @@ export class VideoConverter {
     }
   }
 
-  private async probeSampleAspectRatio(videoPath: string): Promise<string | undefined> {
+  async probeSampleAspectRatio(videoPath: string): Promise<string | undefined> {
     let output: string;
     try {
       output = await this.runCommand('ffprobe', [

@@ -46,8 +46,18 @@ async function main() {
   });
   console.assert(normal.width === 1280 && normal.height === 720, `expected 1280x720, got ${normal.width}x${normal.height}`);
 
+  // Bake-only (no targetHeight): anamorphic source keeps display size, SAR becomes square
+  await fsp.mkdir(`${TMP}/out3`, { recursive: true });
+  const baked = await converter.convert({
+    video: { filePath: `${TMP}/anamorphic.mp4`, fileSize: 0, title: 't', durationSeconds: 1, width: 640, height: 360 },
+    outputDir: `${TMP}/out3`,
+  });
+  console.assert(baked.width === 1280 && baked.height === 360, `expected bake-only 1280x360, got ${baked.width}x${baked.height}`);
+  console.assert(probeSar(baked.filePath) === '1:1', `expected square SAR after bake, got ${probeSar(baked.filePath)}`);
+
   console.log('anamorphic:', anamorphic.width, 'x', anamorphic.height, '| SAR out:', probeSar(anamorphic.filePath));
   console.log('normal:', normal.width, 'x', normal.height, '| SAR out:', probeSar(normal.filePath));
+  console.log('bake-only:', baked.width, 'x', baked.height, '| SAR out:', probeSar(baked.filePath));
 
   await fsp.rm(TMP, { recursive: true, force: true });
   console.log('ALL CHECKS PASSED');

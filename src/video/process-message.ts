@@ -5,6 +5,7 @@ import type { TelegramNotifier } from '../telegram/notifier.js';
 import { buildDeliveryFileName, buildDeliveryPartFileName, buildPartCaption, extractUrls, formatBytes, formatDownloadProgress, truncateCaption, type VideoDownloadProgress, type VideoThumbnail } from './utils.js';
 import type { VideoDownloader } from './downloader.js';
 import { DownloadCancelledError } from './downloader.js';
+import { buildPixelAspectFilter } from './screenshots.js';
 import type { VideoScreenshotGenerator } from './screenshots.js';
 import type { VideoSplitter } from './splitter.js';
 import type { VideoConverter } from './converter.js';
@@ -292,6 +293,25 @@ export class VideoMessageProcessor {
           acceptedMessage,
           'Konversi selesai. Sedang membuat screenshot video...',
         );
+      } else if (await this.needsAnamorphicBake(video)) {
+        // Telegram ignores SAR tags, so an anamorphic source would show
+        // stretched (e.g. 1920x1080 storage with SAR 81:256 is really 9:16
+        // portrait). Re-encode once to bake real dimensions, no resize.
+        await notifier.updateStatus(
+          acceptedMessage,
+          'Download selesai. Sedang memperbaiki dimensi video...',
+        );
+
+        video = await this.videoConverter.convert({
+          video,
+          outputDir,
+          signal,
+        });
+
+        await notifier.updateStatus(
+          acceptedMessage,
+          'Perbaikan dimensi selesai. Sedang membuat screenshot video...',
+        );
       } else {
         await notifier.updateStatus(
           acceptedMessage,
@@ -423,6 +443,17 @@ export class VideoMessageProcessor {
       );
 
       return undefined;
+    }
+  }
+
+  private async needsAnamorphicBake(video: { filePath: string }): Promise<boolean> {
+    try {
+      const sar = await this.videoConverter.probeSampleAspectRatio(video.filePath);
+      return buildPixelAspectFilter(sar) !== undefined;
+    } catch (error) {
+      // If probing fails, assume square pixels rather than re-encoding blindly.
+      console.error('Failed to probe sample aspect ratio:', error);
+      return false;
     }
   }
 
