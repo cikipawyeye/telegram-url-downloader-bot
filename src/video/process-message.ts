@@ -195,6 +195,7 @@ export class VideoMessageProcessor {
         ? `Gagal membaca video dari input tersebut:\n${expansionErrors.join('\n')}`
         : 'Album berhasil dibaca, tetapi tidak berisi video.';
       await notifier.updateStatus(acceptedMessage, message);
+      await notifier.removeDownloadStopButton(acceptedMessage);
       this.pendingCancellations.delete(acceptedMessage.messageId);
       return;
     }
