@@ -294,15 +294,26 @@ export class VideoMessageProcessor {
           acceptedMessage,
           'Konversi selesai. Sedang membuat screenshot video...',
         );
+      } else if (await this.needsAnamorphicBake(video)) {
+        // Declared-dimensions trick failed in practice: Telegram clients
+        // letterbox by the real frame size, not the declared one. Bake the
+        // true display dimensions with a fast re-encode instead.
+        await notifier.updateStatus(
+          acceptedMessage,
+          'Download selesai. Sedang memperbaiki dimensi video...',
+        );
+
+        video = await this.videoConverter.convert({
+          video,
+          outputDir,
+          signal,
+        });
+
+        await notifier.updateStatus(
+          acceptedMessage,
+          'Perbaikan dimensi selesai. Sedang membuat screenshot video...',
+        );
       } else {
-        const displayDims = await this.resolveAnamorphicDisplayDims(video);
-        if (displayDims) {
-          // Telegram clients ignore SAR tags and would show the raw storage
-          // frame stretched (e.g. 1920x1080 with SAR 81:256 is really 9:16).
-          // Instead of paying for a re-encode, declare the true display
-          // dimensions to the Bot API and send the file untouched.
-          video = { ...video, width: displayDims.width, height: displayDims.height };
-        }
         await notifier.updateStatus(
           acceptedMessage,
           `Download selesai. Sedang membuat ${this.screenshotCount} screenshot video...`,
@@ -436,34 +447,14 @@ export class VideoMessageProcessor {
     }
   }
 
-  /**
-   * For anamorphic sources (non-square SAR), returns the true display
-   * dimensions (storage width x SAR). Returns undefined for square pixels or
-   * when the SAR/dimensions cannot be read — the raw file is sent as-is and
-   * the Bot API just declares these dimensions instead of real ones.
-   */
-  private async resolveAnamorphicDisplayDims(video: {
-    filePath: string;
-    width?: number;
-    height?: number;
-  }): Promise<{ width: number; height: number } | undefined> {
+  private async needsAnamorphicBake(video: { filePath: string }): Promise<boolean> {
     try {
       const sar = await this.videoConverter.probeSampleAspectRatio(video.filePath);
-      if (!buildPixelAspectFilter(sar)) {
-        return undefined;
-      }
-
-      const [num, den] = sar!.split(':').map(Number);
-      if (!(num > 0) || !(den > 0) || !video.width || video.width <= 0 || !video.height || video.height <= 0) {
-        return undefined;
-      }
-
-      const displayWidth = Math.round((video.width * num) / den / 2) * 2;
-      return displayWidth > 0 ? { width: displayWidth, height: video.height } : undefined;
+      return buildPixelAspectFilter(sar) !== undefined;
     } catch (error) {
-      // If probing fails, declare storage dimensions rather than guessing.
+      // If probing fails, assume square pixels rather than re-encoding blindly.
       console.error('Failed to probe sample aspect ratio:', error);
-      return undefined;
+      return false;
     }
   }
 

@@ -101,7 +101,9 @@ export class VideoConverter {
       '-c:v',
       'libx264',
       '-preset',
-      'veryfast',
+      // Bake-only repair (no targetHeight) has no compression target worth
+      // tuning for — trade bitrate for wall-clock speed.
+      options.targetHeight === undefined ? 'superfast' : 'veryfast',
       '-crf',
       '20',
       '-pix_fmt',
