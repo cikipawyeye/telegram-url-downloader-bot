@@ -294,31 +294,20 @@ export class VideoMessageProcessor {
           acceptedMessage,
           'Konversi selesai. Sedang membuat screenshot video...',
         );
-      } else if (await this.needsAnamorphicBake(video)) {
-        // Telegram ignores SAR tags, so an anamorphic source would show
-        // stretched (e.g. 1920x1080 storage with SAR 81:256 is really 9:16
-        // portrait). Re-encode once to bake real dimensions, no resize.
-        await notifier.updateStatus(
-          acceptedMessage,
-          'Download selesai. Sedang memperbaiki dimensi video...',
-        );
-
-        video = await this.videoConverter.convert({
-          video,
-          outputDir,
-          signal,
-        });
-
-        await notifier.updateStatus(
-          acceptedMessage,
-          'Perbaikan dimensi selesai. Sedang membuat screenshot video...',
-        );
       } else {
+        const displayDims = await this.resolveAnamorphicDisplayDims(video);
+        if (displayDims) {
+          // Telegram clients ignore SAR tags and would show the raw storage
+          // frame stretched (e.g. 1920x1080 with SAR 81:256 is really 9:16).
+          // Instead of paying for a re-encode, declare the true display
+          // dimensions to the Bot API and send the file untouched.
+          video = { ...video, width: displayDims.width, height: displayDims.height };
+        }
         await notifier.updateStatus(
           acceptedMessage,
           `Download selesai. Sedang membuat ${this.screenshotCount} screenshot video...`,
         );
-    }
+      }
 
     const screenshots = await this.tryGenerateScreenshots({
         acceptedMessage,
@@ -447,14 +436,34 @@ export class VideoMessageProcessor {
     }
   }
 
-  private async needsAnamorphicBake(video: { filePath: string }): Promise<boolean> {
+  /**
+   * For anamorphic sources (non-square SAR), returns the true display
+   * dimensions (storage width x SAR). Returns undefined for square pixels or
+   * when the SAR/dimensions cannot be read — the raw file is sent as-is and
+   * the Bot API just declares these dimensions instead of real ones.
+   */
+  private async resolveAnamorphicDisplayDims(video: {
+    filePath: string;
+    width?: number;
+    height?: number;
+  }): Promise<{ width: number; height: number } | undefined> {
     try {
       const sar = await this.videoConverter.probeSampleAspectRatio(video.filePath);
-      return buildPixelAspectFilter(sar) !== undefined;
+      if (!buildPixelAspectFilter(sar)) {
+        return undefined;
+      }
+
+      const [num, den] = sar!.split(':').map(Number);
+      if (!(num > 0) || !(den > 0) || !video.width || video.width <= 0 || !video.height || video.height <= 0) {
+        return undefined;
+      }
+
+      const displayWidth = Math.round((video.width * num) / den / 2) * 2;
+      return displayWidth > 0 ? { width: displayWidth, height: video.height } : undefined;
     } catch (error) {
-      // If probing fails, assume square pixels rather than re-encoding blindly.
+      // If probing fails, declare storage dimensions rather than guessing.
       console.error('Failed to probe sample aspect ratio:', error);
-      return false;
+      return undefined;
     }
   }
 
