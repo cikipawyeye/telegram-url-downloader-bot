@@ -89,11 +89,31 @@ type FfprobeMetadataOutput = {
   streams?: Array<{
     width?: number | string;
     height?: number | string;
+    sample_aspect_ratio?: string;
   }>;
   format?: {
     duration?: number | string;
   };
 };
+
+function applySampleAspectRatio(
+  storageWidth: number | undefined,
+  sar: string | undefined,
+): number | undefined {
+  if (storageWidth === undefined || !sar || sar === 'N/A' || sar === '0:1' || sar === '1:1') {
+    return storageWidth;
+  }
+
+  const [numerator, denominator] = sar.split(':').map(Number);
+  if (
+    !Number.isFinite(numerator) || numerator <= 0 ||
+    !Number.isFinite(denominator) || denominator <= 0
+  ) {
+    return storageWidth;
+  }
+
+  return Math.round(storageWidth * (numerator / denominator));
+}
 
 export class VideoDownloader {
   private readonly downloadTimeoutMs: number;
@@ -610,7 +630,7 @@ export class VideoDownloader {
         '-select_streams',
         'v:0',
         '-show_entries',
-        'stream=width,height:format=duration',
+        'stream=width,height,sample_aspect_ratio:format=duration',
         '-of',
         'json',
         filePath,
@@ -622,10 +642,17 @@ export class VideoDownloader {
           && normalizePositiveInteger(stream.height) !== undefined
       ));
 
+      const storageWidth = normalizePositiveInteger(videoStream?.width);
+      const storageHeight = normalizePositiveInteger(videoStream?.height);
+
       return {
         durationSeconds: normalizePositiveNumber(metadata.format?.duration),
-        width: normalizePositiveInteger(videoStream?.width),
-        height: normalizePositiveInteger(videoStream?.height),
+        // Report *display* dimensions: for anamorphic sources (non-square
+        // pixels) multiply the stored width by the sample aspect ratio so every
+        // consumer (Telegram size hints, DB) sees the aspect users actually
+        // perceive. Telegram clients ignore the MP4 SAR tag.
+        width: applySampleAspectRatio(storageWidth, videoStream?.sample_aspect_ratio),
+        height: storageHeight,
       };
     } catch (error) {
       console.error('Failed to probe video metadata:', error);

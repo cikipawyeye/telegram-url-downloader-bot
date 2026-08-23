@@ -8,6 +8,8 @@ export type VideoSegment = {
   fileSize: number;
   index: number;
   total: number;
+  width?: number;
+  height?: number;
 };
 
 export class VideoSplitter {
@@ -26,6 +28,8 @@ export class VideoSplitter {
         fileSize: video.fileSize,
         index: 1,
         total: 1,
+        width: video.width,
+        height: video.height,
       }];
     }
 
@@ -51,6 +55,9 @@ export class VideoSplitter {
           ...segment,
           index: index + 1,
           total: segments.length,
+          // Stream-copied parts keep the source dimensions.
+          width: video.width,
+          height: video.height,
         }));
       }
 
