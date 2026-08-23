@@ -13,6 +13,7 @@ export type AppConfig = {
   ytdlpProxy?: string;
   screenshotCount: number;
   sendVideoInAlbum: boolean;
+  reencodeAnamorphic: boolean;
 };
 
 export function loadConfig(): AppConfig {
@@ -45,5 +46,6 @@ export function loadConfig(): AppConfig {
     ytdlpProxy: process.env.YTDLP_PROXY || undefined,
     screenshotCount: Number(process.env.SCREENSHOT_COUNT ?? 5),
     sendVideoInAlbum: process.env.SEND_VIDEO_IN_ALBUM !== 'false',
+    reencodeAnamorphic: process.env.REENCODE_ANAMORPHIC !== 'false',
   };
 }

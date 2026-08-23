@@ -30,6 +30,7 @@ export class VideoMessageProcessor {
   private readonly db?: BotDatabase;
   private readonly screenshotCount: number;
   private readonly sendVideoInAlbum: boolean;
+  private readonly reencodeAnamorphic: boolean;
   private readonly pendingCancellations = new Map<number, AbortController>();
 
   constructor(options: {
@@ -41,6 +42,7 @@ export class VideoMessageProcessor {
     workspaceManager: WorkspaceManager;
     screenshotCount: number;
     sendVideoInAlbum: boolean;
+    reencodeAnamorphic: boolean;
     db?: BotDatabase;
   }) {
     this.maxFileSizeBytes = options.maxFileSizeBytes;
@@ -51,6 +53,7 @@ export class VideoMessageProcessor {
     this.workspaceManager = options.workspaceManager;
     this.screenshotCount = options.screenshotCount;
     this.sendVideoInAlbum = options.sendVideoInAlbum;
+    this.reencodeAnamorphic = options.reencodeAnamorphic;
     this.db = options.db;
   }
 
@@ -294,7 +297,7 @@ export class VideoMessageProcessor {
           acceptedMessage,
           'Konversi selesai. Sedang membuat screenshot video...',
         );
-      } else if (await this.needsAnamorphicBake(video)) {
+      } else if (this.reencodeAnamorphic && (await this.needsAnamorphicBake(video))) {
         // Declared-dimensions trick failed in practice: Telegram clients
         // letterbox by the real frame size, not the declared one. Bake the
         // true display dimensions with a fast re-encode instead.
