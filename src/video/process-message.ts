@@ -2,7 +2,7 @@ import type { WorkspaceManager } from '../storage/workspace.js';
 import type { BotDatabase } from '../storage/database.js';
 import type { StatusMessage } from '../telegram/notifier.js';
 import type { TelegramNotifier } from '../telegram/notifier.js';
-import { buildDeliveryFileName, buildDeliveryPartFileName, buildPartCaption, extractUrls, formatBytes, formatDownloadProgress, truncateCaption, type VideoDownloadProgress, type VideoThumbnail } from './utils.js';
+import { buildDeliveryFileName, buildDeliveryPartFileName, buildPartCaption, buildFailureSummary, extractUrls, formatBytes, formatDownloadProgress, summarizeErrorMessage, truncateCaption, type BatchFailure, type VideoDownloadProgress, type VideoThumbnail } from './utils.js';
 import type { VideoDownloader } from './downloader.js';
 import { DownloadCancelledError } from './downloader.js';
 import { buildPixelAspectFilter } from './screenshots.js';
@@ -120,10 +120,10 @@ export class VideoMessageProcessor {
           this.db?.finishJob(jobId, 'failed');
         }
 
-        const reason = error instanceof Error ? error.message : String(error);
+        const reason = summarizeErrorMessage(error);
         await notifier.updateStatus(
           acceptedMessage,
-          `Proses berhenti karena error. Kirim ulang link untuk melanjutkan.\n${reason.slice(0, 300)}`,
+          `Proses berhenti karena error. Kirim ulang link untuk melanjutkan.\n${reason}`,
         ).catch(() => undefined);
       });
     } catch (error) {
@@ -176,14 +176,13 @@ export class VideoMessageProcessor {
     jobId?: number,
   ): Promise<void> {
     const expandedUrls: string[] = [];
-    const expansionErrors: string[] = [];
+    const expansionFailures: BatchFailure[] = [];
     for (const url of urls) {
       try {
         expandedUrls.push(...await this.videoDownloader.expandUrl(url));
       } catch (error) {
         console.error(`Failed to read bulk URL ${url}:`, error);
-        const reason = error instanceof Error ? error.message : String(error);
-        expansionErrors.push(`${url}: ${reason}`);
+        expansionFailures.push({ url, reason: summarizeErrorMessage(error) });
       }
     }
 
@@ -194,8 +193,8 @@ export class VideoMessageProcessor {
         this.db?.setJobTotalUrls(jobId, 0);
         this.db?.finishJob(jobId, 'failed');
       }
-      const message = expansionErrors.length > 0
-        ? `Gagal membaca video dari input tersebut:\n${expansionErrors.join('\n')}`
+      const message = expansionFailures.length > 0
+        ? buildFailureSummary('Gagal membaca video dari input tersebut:', expansionFailures)
         : 'Album berhasil dibaca, tetapi tidak berisi video.';
       await notifier.updateStatus(acceptedMessage, message);
       await notifier.removeDownloadStopButton(acceptedMessage);
@@ -207,7 +206,7 @@ export class VideoMessageProcessor {
       this.db?.setJobTotalUrls(jobId, urls.length);
     }
 
-    const failed: string[] = [];
+    const failed: BatchFailure[] = [];
     let completed = 0;
 
     for (const [index, url] of urls.entries()) {
@@ -248,12 +247,17 @@ export class VideoMessageProcessor {
           await notifier.confirmStopped(acceptedMessage);
           return;
         }
-        failed.push(url);
+        const reason = summarizeErrorMessage(error);
+        failed.push({ url, reason });
         console.error(`Failed to process bulk URL ${url}:`, error);
         if (itemId !== undefined) {
-          this.db?.failItem(itemId, error instanceof Error ? error.message : String(error));
+          this.db?.failItem(itemId, reason);
         }
-        await notifier.updateStatus(acceptedMessage, `Link ${index + 1}/${urls.length} gagal. Lanjut ke link berikutnya...`);
+        const hasNextLink = index + 1 < urls.length;
+        await notifier.updateStatus(
+          acceptedMessage,
+          `Link ${index + 1}/${urls.length} gagal: ${reason}${hasNextLink ? '\nLanjut ke link berikutnya...' : ''}`,
+        );
       } finally {
         await this.workspaceManager.remove(workspace);
       }
@@ -264,7 +268,10 @@ export class VideoMessageProcessor {
     if (failed.length === 0) {
       await notifier.deleteStatus(acceptedMessage);
     } else {
-      await notifier.updateStatus(acceptedMessage, `Bulk selesai: ${completed}/${urls.length} berhasil, ${failed.length} gagal.`);
+      const header = urls.length <= 1
+        ? 'Gagal memproses link:'
+        : `Bulk selesai: ${completed}/${urls.length} berhasil, ${failed.length} gagal.`;
+      await notifier.updateStatus(acceptedMessage, buildFailureSummary(header, failed));
     }
   }
 

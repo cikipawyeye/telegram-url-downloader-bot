@@ -10,6 +10,7 @@ Bot ini menerima URL dari user, mencoba mengunduh videonya dengan `yt-dlp`, lalu
 - unduh Bunkr (`https://*.bunkr.*/file/<id>` atau `/f/<id>`) pakai custom downloader (detail API → sign token → media), dengan dukung progress & batalkan
 - URL album Bunkr (`/a/<id>`) otomatis diperluas menjadi bulk download video saja; gambar diabaikan
 - kirim kembali memakai `sendVideo` + `supports_streaming: true`
+- kalau ada link yang gagal, alasan errornya ditampilkan di pesan status (per link dan di ringkasan akhir), bukan hanya jumlah keberhasilan/gagal
 - auto cleanup file sementara
 - auto split video yang melebihi batas upload menjadi beberapa part
 - menu `/convert` untuk mengubah ukuran video ke resolusi 1080p / 720p / 480p / 240p (kompatibel streaming di Telegram)

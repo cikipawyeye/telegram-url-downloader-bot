@@ -78,6 +78,46 @@ export function truncateCaption(title: string, maxLength = 900): string {
   return `${title.slice(0, maxLength - 1)}…`;
 }
 
+// Telegram rejects message/edits longer than 4096 characters and an over-long
+// status update fails silently (the user keeps seeing the previous text), so
+// failure details are capped well below that limit.
+const TELEGRAM_MESSAGE_MAX_LENGTH = 3500;
+const FAILURE_REASON_MAX_LENGTH = 300;
+const FAILURE_URL_MAX_LENGTH = 120;
+
+export type BatchFailure = {
+  url: string;
+  reason: string;
+};
+
+/**
+ * Turn an error into a single-line reason that is safe to show in Telegram:
+ * whitespace/newlines are collapsed (ffmpeg/yt-dlp stderr can be multi-line)
+ * and long dumps are truncated.
+ */
+export function summarizeErrorMessage(error: unknown, maxLength = FAILURE_REASON_MAX_LENGTH): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return truncateSingleLine(message, maxLength);
+}
+
+/**
+ * Status text for a failed batch: a header plus one numbered line per failed
+ * link with its reason. Entries that no longer fit inside the Telegram message
+ * limit are replaced by a count, so the message is always delivered.
+ */
+export function buildFailureSummary(header: string, failures: BatchFailure[]): string {
+  const details = failures.map((failure, index) => (
+    `${index + 1}. ${truncateSingleLine(failure.url, FAILURE_URL_MAX_LENGTH)} — ${truncateSingleLine(failure.reason)}`
+  ));
+
+  let kept = details.length;
+  while (kept > 0 && joinFailureSummary(header, details.slice(0, kept), details.length - kept).length > TELEGRAM_MESSAGE_MAX_LENGTH) {
+    kept -= 1;
+  }
+
+  return joinFailureSummary(header, details.slice(0, kept), details.length - kept);
+}
+
 export function sanitizeFileName(fileName: string): string {
   return fileName.replace(/[<>:"/\\|?*\x00-\x1F]/g, '_');
 }
@@ -161,6 +201,26 @@ function formatDuration(totalSeconds: number): string {
   }
 
   return `${remainingSeconds}d`;
+}
+
+function joinFailureSummary(header: string, details: string[], droppedCount: number): string {
+  const lines = [header, '', ...details];
+
+  if (droppedCount > 0) {
+    lines.push(`…dan ${droppedCount} link lain gagal.`);
+  }
+
+  return lines.join('\n');
+}
+
+function truncateSingleLine(text: string, maxLength = FAILURE_REASON_MAX_LENGTH): string {
+  const singleLine = text.replace(/\s+/g, ' ').trim();
+
+  if (singleLine.length === 0) {
+    return 'Alasan tidak diketahui.';
+  }
+
+  return singleLine.length <= maxLength ? singleLine : `${singleLine.slice(0, maxLength - 1)}…`;
 }
 
 function truncateFileNameBase(fileName: string, maxLength = 120): string {
