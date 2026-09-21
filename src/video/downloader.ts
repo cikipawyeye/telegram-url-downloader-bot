@@ -76,6 +76,8 @@ export type DownloadVideoOptions = {
   url: string;
   outputDir: string;
   signal?: AbortSignal;
+  /** Ignore the configured proxy and download over a direct connection. */
+  noProxy?: boolean;
   onProgress?: (progress: VideoDownloadProgress) => void;
 };
 
@@ -184,7 +186,7 @@ export class VideoDownloader {
       noPlaylist: true,
       output: outputTemplate,
       progressDelta: 2,
-      proxy: this.proxy,
+      ...this.buildProxyOptions(options.noProxy === true),
     });
 
     if (onProgress) {
@@ -195,6 +197,22 @@ export class VideoDownloader {
 
     const result = await this.runWithTimeout(download, signal);
     return await this.resolveDownloadedVideo(result, outputDir);
+  }
+
+  /**
+   * Proxy flags for a single yt-dlp run.
+   *
+   * yt-dlp also honours the HTTP_PROXY / HTTPS_PROXY / ALL_PROXY environment
+   * variables, so simply leaving `--proxy` out is not enough to guarantee a
+   * direct connection: `--proxy ""` is yt-dlp's documented "connect directly"
+   * switch and it overrides those environment variables as well.
+   */
+  private buildProxyOptions(noProxy: boolean): { proxy?: string; rawArgs?: string[] } {
+    if (noProxy) {
+      return { rawArgs: ['--proxy', ''] };
+    }
+
+    return { proxy: this.proxy };
   }
 
   private async fetchBunkDownloaderPageUrl(url: string): Promise<string> {

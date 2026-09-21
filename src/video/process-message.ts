@@ -2,7 +2,7 @@ import type { WorkspaceManager } from '../storage/workspace.js';
 import type { BotDatabase } from '../storage/database.js';
 import type { StatusMessage } from '../telegram/notifier.js';
 import type { TelegramNotifier } from '../telegram/notifier.js';
-import { buildDeliveryFileName, buildDeliveryPartFileName, buildPartCaption, buildFailureSummary, extractUrls, formatBytes, formatDownloadProgress, summarizeErrorMessage, truncateCaption, type BatchFailure, type VideoDownloadProgress, type VideoThumbnail } from './utils.js';
+import { buildDeliveryFileName, buildDeliveryPartFileName, buildPartCaption, buildFailureSummary, formatBytes, formatDownloadProgress, hasNoProxyOverride, parseVideoRequestItems, summarizeErrorMessage, truncateCaption, type BatchFailure, type VideoDownloadProgress, type VideoRequestItem, type VideoThumbnail } from './utils.js';
 import type { VideoDownloader } from './downloader.js';
 import { DownloadCancelledError } from './downloader.js';
 import { buildPixelAspectFilter } from './screenshots.js';
@@ -15,6 +15,15 @@ export type ProcessVideoMessageRequest = {
   text: string;
   userId: string;
   convertToHeight?: number;
+  /** Force a direct connection (no proxy) for every URL in this message. */
+  noProxy?: boolean;
+};
+
+type BatchOptions = {
+  convertToHeight?: number;
+  forceNoProxy: boolean;
+  signal: AbortSignal;
+  jobId?: number;
 };
 
 export class VideoMessageProcessor {
@@ -69,16 +78,23 @@ export class VideoMessageProcessor {
     return true;
   }
 
-  async process({ notifier, text, userId, convertToHeight }: ProcessVideoMessageRequest): Promise<void> {
-    const urls = extractUrls(text.trim());
+  async process({ notifier, text, userId, convertToHeight, noProxy }: ProcessVideoMessageRequest): Promise<void> {
+    const items = parseVideoRequestItems(text.trim());
+    // `/noproxy` forces every link of the message, while the marker inside the
+    // text only opts out the links it shares a line with (or follows).
+    const forceNoProxy = noProxy === true;
 
-    if (urls.length === 0) {
-      await notifier.sendInvalidUrl();
+    if (items.length === 0) {
+      if (forceNoProxy || hasNoProxyOverride(text)) {
+        await notifier.sendNoProxyHint();
+      } else {
+        await notifier.sendInvalidUrl();
+      }
       return;
     }
 
     const maxBulkUrls = parseInt(process.env.MAX_BULK_URLS ?? '20', 10);
-    if (urls.length > maxBulkUrls) {
+    if (items.length > maxBulkUrls) {
       await notifier.sendBatchLimit(maxBulkUrls);
       return;
     }
@@ -106,11 +122,9 @@ export class VideoMessageProcessor {
       this.enqueueBatch(
         notifier,
         acceptedMessage,
-        urls,
+        items,
         userId,
-        convertToHeight,
-        controller.signal,
-        jobId,
+        { convertToHeight, forceNoProxy, signal: controller.signal, jobId },
       ).catch(async (error) => {
         console.error(`Batch failed for status message ${acceptedMessage.messageId}:`, error);
 
@@ -134,27 +148,15 @@ export class VideoMessageProcessor {
   private enqueueBatch(
     notifier: TelegramNotifier,
     acceptedMessage: StatusMessage,
-    urls: string[],
+    items: VideoRequestItem[],
     userId: string,
-    convertToHeight?: number,
-    signal?: AbortSignal,
-    jobId?: number,
+    batch: BatchOptions,
   ): Promise<void> {
     const chatId = notifier.chatId;
     const previous = VideoMessageProcessor.batchQueues.get(chatId) ?? Promise.resolve();
     const current = previous
       .catch(() => undefined)
-      .then(() =>
-        this.processBatch(
-          notifier,
-          acceptedMessage,
-          urls,
-          userId,
-          convertToHeight,
-          signal,
-          jobId,
-        ),
-      );
+      .then(() => this.processBatch(notifier, acceptedMessage, items, userId, batch));
     // Reflect the final settled state in the map regardless of failure, so the
     // next batch for this chat is never blocked by a rejected queue entry.
     const queueEntry = current.then(
@@ -169,25 +171,26 @@ export class VideoMessageProcessor {
   private async processBatch(
     notifier: TelegramNotifier,
     acceptedMessage: StatusMessage,
-    urls: string[],
+    items: VideoRequestItem[],
     userId: string,
-    convertToHeight?: number,
-    signal?: AbortSignal,
-    jobId?: number,
+    { convertToHeight, forceNoProxy, signal, jobId }: BatchOptions,
   ): Promise<void> {
-    const expandedUrls: string[] = [];
+    const expandedItems: VideoRequestItem[] = [];
     const expansionFailures: BatchFailure[] = [];
-    for (const url of urls) {
+    for (const item of items) {
       try {
-        expandedUrls.push(...await this.videoDownloader.expandUrl(url));
+        const expandedUrls = await this.videoDownloader.expandUrl(item.url);
+        expandedItems.push(
+          ...expandedUrls.map((url) => ({ url, noProxy: item.noProxy || forceNoProxy })),
+        );
       } catch (error) {
-        console.error(`Failed to read bulk URL ${url}:`, error);
-        expansionFailures.push({ url, reason: summarizeErrorMessage(error) });
+        console.error(`Failed to read bulk URL ${item.url}:`, error);
+        expansionFailures.push({ url: item.url, reason: summarizeErrorMessage(error) });
       }
     }
 
-    urls = expandedUrls;
-    if (urls.length === 0) {
+    items = expandedItems;
+    if (items.length === 0) {
       this.pendingCancellations.delete(acceptedMessage.messageId);
       if (jobId !== undefined) {
         this.db?.setJobTotalUrls(jobId, 0);
@@ -203,32 +206,37 @@ export class VideoMessageProcessor {
     }
 
     if (jobId !== undefined) {
-      this.db?.setJobTotalUrls(jobId, urls.length);
+      this.db?.setJobTotalUrls(jobId, items.length);
     }
 
     const failed: BatchFailure[] = [];
     let completed = 0;
 
-    for (const [index, url] of urls.entries()) {
-      if (signal?.aborted) {
+    for (const [index, item] of items.entries()) {
+      if (signal.aborted) {
         await notifier.confirmStopped(acceptedMessage);
         this.pendingCancellations.delete(acceptedMessage.messageId);
         return;
       }
 
       const workspace = await this.workspaceManager.create(userId);
-      await notifier.updateStatus(acceptedMessage, `Selesai ${completed}/${urls.length}. Memproses ${index + 1}/${urls.length}...`);
+      const noProxyLabel = item.noProxy ? ' tanpa proxy' : '';
+      await notifier.updateStatus(
+        acceptedMessage,
+        `Selesai ${completed}/${items.length}. Memproses ${index + 1}/${items.length}${noProxyLabel}...`,
+      );
 
       let itemId: number | undefined;
       if (jobId !== undefined) {
-        itemId = this.db?.addItem(jobId, url);
+        itemId = this.db?.addItem(jobId, item.url, { noProxy: item.noProxy });
       }
 
       try {
         const video = await this.videoDownloader.download({
-          url,
+          url: item.url,
           outputDir: workspace.dirPath,
           signal,
+          noProxy: item.noProxy,
           onProgress: (progress) => {
             void this.reportDownloadProgress(notifier, acceptedMessage, progress);
           },
@@ -248,15 +256,15 @@ export class VideoMessageProcessor {
           return;
         }
         const reason = summarizeErrorMessage(error);
-        failed.push({ url, reason });
-        console.error(`Failed to process bulk URL ${url}:`, error);
+        failed.push({ url: item.url, reason });
+        console.error(`Failed to process bulk URL ${item.url}:`, error);
         if (itemId !== undefined) {
           this.db?.failItem(itemId, reason);
         }
-        const hasNextLink = index + 1 < urls.length;
+        const hasNextLink = index + 1 < items.length;
         await notifier.updateStatus(
           acceptedMessage,
-          `Link ${index + 1}/${urls.length} gagal: ${reason}${hasNextLink ? '\nLanjut ke link berikutnya...' : ''}`,
+          `Link ${index + 1}/${items.length} gagal: ${reason}${hasNextLink ? '\nLanjut ke link berikutnya...' : ''}`,
         );
       } finally {
         await this.workspaceManager.remove(workspace);
@@ -268,9 +276,9 @@ export class VideoMessageProcessor {
     if (failed.length === 0) {
       await notifier.deleteStatus(acceptedMessage);
     } else {
-      const header = urls.length <= 1
+      const header = items.length <= 1
         ? 'Gagal memproses link:'
-        : `Bulk selesai: ${completed}/${urls.length} berhasil, ${failed.length} gagal.`;
+        : `Bulk selesai: ${completed}/${items.length} berhasil, ${failed.length} gagal.`;
       await notifier.updateStatus(acceptedMessage, buildFailureSummary(header, failed));
     }
   }

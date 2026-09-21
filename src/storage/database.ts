@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const MIGRATIONS: Array<{ version: number; sql: string }> = [
   {
@@ -72,6 +72,14 @@ const MIGRATIONS: Array<{ version: number; sql: string }> = [
       );
 
       CREATE INDEX IF NOT EXISTS idx_job_items_job ON job_items(job_id);
+    `,
+  },
+  {
+    version: 2,
+    sql: `
+      -- Per URL: the user asked to bypass the yt-dlp proxy for this link
+      -- (the "noproxy" marker / /noproxy in the Telegram message).
+      ALTER TABLE job_items ADD COLUMN no_proxy INTEGER NOT NULL DEFAULT 0;
     `,
   },
 ];
@@ -197,8 +205,11 @@ export class BotDatabase {
 
   // ---- job items --------------------------------------------------------
 
-  addItem(jobId: number, url: string): number {
-    const result = this.db.prepare("INSERT INTO job_items (job_id, url) VALUES (?, ?)").run(jobId, url);
+  addItem(jobId: number, url: string, options: { noProxy?: boolean } = {}): number {
+    const result = this.db
+      .prepare('INSERT INTO job_items (job_id, url, no_proxy) VALUES (?, ?, ?)')
+      .run(jobId, url, options.noProxy === true ? 1 : 0);
+
     return Number(result.lastInsertRowid);
   }
 

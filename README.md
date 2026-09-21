@@ -7,6 +7,7 @@ Bot ini menerima URL dari user, mencoba mengunduh videonya dengan `yt-dlp`, lalu
 - bulk download hingga 10 URL dalam satu pesan (diproses berurutan)
 - webhook-ready untuk deployment
 - download dengan `yt-dlp`
+- override tanpa proxy per pesan dari Telegram (`noproxy <link>` atau `/noproxy <link>`), berguna kalau proxy justru bikin link gagal
 - unduh Bunkr (`https://*.bunkr.*/file/<id>` atau `/f/<id>`) pakai custom downloader (detail API → sign token → media), dengan dukung progress & batalkan
 - URL album Bunkr (`/a/<id>`) otomatis diperluas menjadi bulk download video saja; gambar diabaikan
 - kirim kembali memakai `sendVideo` + `supports_streaming: true`
@@ -116,6 +117,24 @@ sudo systemctl restart nama-service-aplikasi.service
 ```
 
 `socks5://` membuat resolusi DNS dilakukan oleh host. Jika ingin resolusi DNS juga melalui proxy dan versi `yt-dlp` yang terpasang mendukungnya, gunakan `socks5h://127.0.0.1:40000`.
+
+## Override tanpa proxy dari pesan Telegram
+Kalau ada link yang justru gagal karena proxinya, user bisa mematikan proxy untuk link tersebut langsung dari pesan tanpa mengubah konfigurasi server:
+
+- tulis penanda di pesan: `noproxy <link>`, `!noproxy <link>`, atau `tanpa proxy <link>`
+- penanda di baris sendiri berlaku untuk link-link di baris berikutnya:
+  ```text
+  noproxy
+  https://situs-a.com/video
+  https://situs-b.com/video
+  ```
+- atau pakai `/noproxy <link>` untuk memaksa **semua** link di pesan itu tanpa proxy (mis. `/noproxy https://a.com/v1 https://b.com/v2`)
+
+Detail teknis:
+- override hanya berlaku pada unduhan `yt-dlp`; download Bunkr tidak memakai proxy sama sekali
+- saat override aktif, bot mengirim `--proxy ""` ke `yt-dlp`. Ini adalah cara resmi `yt-dlp` untuk koneksi langsung, sekaligus menimpa env `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` yang mungkin ikut terbaca
+- link yang diunduh tanpa proxy ditandai di pesan status (`Memproses 2/3 tanpa proxy...`) dan dicatat di kolom `job_items.no_proxy`
+- penanda tidak akan salah dikenali dari dalam URL (mis. `https://situs.com/noproxy` tetap dianggap link biasa)
 
 ## Reverse proxy
 Arahkan domain HTTPS kamu ke port aplikasi, lalu set:

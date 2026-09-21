@@ -50,6 +50,18 @@ export class TelegramNotifier {
     await this.ctx.reply(`Maksimal ${max} URL per pesan.`, { reply_parameters: this.replyParameters() });
   }
 
+  async sendNoProxyHint(): Promise<void> {
+    await this.ctx.reply(
+      [
+        'Sertakan link yang ingin diunduh tanpa proxy, misalnya:',
+        '',
+        '/noproxy https://contoh.com/video',
+        'noproxy https://contoh.com/video',
+      ].join('\n'),
+      { reply_parameters: this.replyParameters() },
+    );
+  }
+
   async sendAccepted(): Promise<StatusMessage> {
     const message = await this.ctx.reply('Link diterima. Sedang mencoba mendownload video...', {
       reply_parameters: this.replyParameters(),

@@ -39,6 +39,68 @@ export function extractUrls(text: string): string[] {
     .filter((url, index, urls) => urls.indexOf(url) === index);
 }
 
+/**
+ * Message marker that bypasses the configured yt-dlp proxy (YTDLP_PROXY) for a
+ * single request, e.g. when the proxy itself is what makes a site fail.
+ *
+ * Matches "noproxy", "no-proxy", "no proxy" and the Indonesian "tanpa proxy",
+ * optionally prefixed with one of ! / # - so "!noproxy" and "--noproxy" work
+ * too. The marker has to start the line or follow whitespace/comma, so a URL
+ * such as https://example.com/noproxy is never mistaken for it.
+ */
+const NO_PROXY_MARKER_PATTERN = /(?:^|[\s,])(?:[!/#-]{0,2})(?:no|tanpa)[\s._-]*proxy\b/i;
+
+export function hasNoProxyOverride(text: string): boolean {
+  return NO_PROXY_MARKER_PATTERN.test(text);
+}
+
+export type VideoRequestItem = {
+  url: string;
+  /** Download this URL over a direct connection, ignoring the proxy. */
+  noProxy: boolean;
+};
+
+/**
+ * Resolve the URLs of a message together with their per-URL proxy override.
+ *
+ * A marker next to a URL applies to that URL only, while a marker on a line of
+ * its own turns the override on for every following line:
+ *
+ *   https://a           -> with proxy
+ *   noproxy https://b   -> without proxy
+ *   noproxy
+ *   https://c           -> without proxy
+ */
+export function parseVideoRequestItems(text: string): VideoRequestItem[] {
+  const items: VideoRequestItem[] = [];
+  const seenUrls = new Set<string>();
+  let noProxyMode = false;
+
+  for (const line of text.split(/\r?\n/)) {
+    const urls = extractUrls(line);
+    const hasMarker = hasNoProxyOverride(line);
+
+    if (urls.length === 0) {
+      noProxyMode = noProxyMode || hasMarker;
+      continue;
+    }
+
+    const noProxy = noProxyMode || hasMarker;
+
+    for (const url of urls) {
+      if (seenUrls.has(url)) {
+        continue;
+      }
+
+      seenUrls.add(url);
+      items.push({ url, noProxy });
+    }
+  }
+
+  return items;
+}
+
+
 export function buildDeliveryFileName(filePath: string, title: string): string {
   const extension = path.extname(filePath);
   const fallbackBaseName = path.basename(filePath, extension);

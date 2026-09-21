@@ -7,6 +7,7 @@ export const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: 'start', description: 'Mulai dan lihat petunjuk singkat' },
   { command: 'help', description: 'Cara menggunakan bot' },
   { command: 'convert', description: 'Unduh & ubah ukuran video ke resolusi tertentu' },
+  { command: 'noproxy', description: 'Unduh link tanpa proxy (koneksi langsung)' },
 ];
 
 export const CONVERT_RESOLUTIONS = [1080, 720, 480, 240] as const;
@@ -19,6 +20,11 @@ const HELP_TEXT = [
   '3. Bot akan mengunduh videonya lalu mengirimkannya kembali sebagai video yang bisa di-stream langsung di Telegram.',
   '',
   'Untuk mengubah ukuran video, gunakan /convert lalu pilih resolusi yang diinginkan (1080p, 720p, 480p, atau 240p), lalu kirimkan link videonya.',
+  '',
+  'Kalau link gagal gara-gara proxinya, lewati proxy untuk link tersebut:',
+  '- tulis penanda noproxy di pesan, mis. "noproxy <link>" atau "tanpa proxy <link>"',
+  '- penanda di barisnya sendiri berlaku untuk link-link di baris berikutnya',
+  '- atau pakai /noproxy <link> untuk memaksa semua link di pesan itu tanpa proxy',
   '',
   'Catatan: video yang dikirim dalam satu album (media group) akan dikompres Telegram.',
 ].join('\n');
@@ -64,6 +70,7 @@ export function registerBotHandlers(
         'Bot akan mencoba mengunduh video dari URL tersebut lalu mengirimkannya kembali sebagai video streamable di Telegram.',
         '',
         'Gunakan /convert untuk mengubah ukuran video ke resolusi tertentu.',
+        'Gunakan /noproxy untuk mengunduh link tanpa melewati proxy.',
         '',
         'Ketik /help untuk instruksi lengkap.',
       ].join('\n'),
@@ -154,13 +161,15 @@ export function registerBotHandlers(
     await ctx.answerCallbackQuery();
   });
 
-  bot.on('message:text', async (ctx) => {
+  // Shared by plain messages and /noproxy: records the user/chat, consumes a
+  // pending /convert selection and hands the links over to the processor.
+  const handleVideoMessage = async (ctx: Context, text: string, noProxy = false): Promise<void> => {
     db.touchUser(ctx.from ?? {});
     db.touchChat(ctx.chat ?? {});
 
     const chatId = ctx.chat?.id;
     const pending = chatId !== undefined ? db.getPendingConversion(chatId) : undefined;
-    const hasUrl = URL_PATTERN.test(ctx.message.text);
+    const hasUrl = URL_PATTERN.test(text);
 
     if (pending && hasUrl && chatId !== undefined) {
       // Consume the pending conversion and remove the instruction message's
@@ -180,10 +189,21 @@ export function registerBotHandlers(
 
     await videoMessageProcessor.process({
       notifier: new TelegramNotifier(ctx, bot),
-      text: ctx.message.text,
+      text,
       userId: String(ctx.from?.id ?? 'unknown'),
       convertToHeight: pending?.height,
+      noProxy,
     });
+  };
+
+  // Registered before the generic text handler so /noproxy is not handled twice.
+  // Without arguments the processor replies with a usage hint.
+  bot.command('noproxy', async (ctx) => {
+    await handleVideoMessage(ctx, ctx.match, true);
+  });
+
+  bot.on('message:text', async (ctx) => {
+    await handleVideoMessage(ctx, ctx.message.text);
   });
 
   bot.catch(async (error) => {
