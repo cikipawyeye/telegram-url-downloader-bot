@@ -65,6 +65,16 @@ const BUNKR_HTTPS_AGENT = new https.Agent({
 const VIDEO_FORMAT = 'best[ext=mp4][vcodec^=avc1][acodec^=mp4a]/bestvideo+bestaudio/best';
 const METADATA_PROBE_TIMEOUT_MS = 30_000;
 
+// Google Drive links are handled by the external `gdown` binary when it is
+// available; yt-dlp cannot reliably fetch Drive files (confirm-token pages,
+// quota interstitials, folder listings). Without the binary the request keeps
+// falling through to the regular yt-dlp path.
+const GDOWN_BINARY = 'gdown';
+const GDOWN_VERSION_TIMEOUT_MS = 10_000;
+// Keep only the tail of the combined gdown output for error reporting, so a
+// chatty folder download cannot balloon the memory usage.
+const GDOWN_OUTPUT_TAIL_LIMIT = 4_000;
+
 export class DownloadCancelledError extends Error {
   constructor() {
     super('Unduhan dibatalkan oleh pengguna.');
@@ -177,6 +187,14 @@ export class VideoDownloader {
       return await this.downloadFromBunk(options);
     }
 
+    if (isGoogleDriveUrl(options.url)) {
+      const gdownBinary = await resolveGdownBinary();
+      if (gdownBinary !== undefined) {
+        return await this.downloadWithGdown(options, gdownBinary);
+      }
+      // No gdown binary: keep the legacy behaviour and let yt-dlp try.
+    }
+
     const { onProgress, outputDir, signal, url } = options;
     const outputTemplate = path.join(outputDir, 'download.%(ext)s');
     const download = this.ytdlp.download(url, {
@@ -213,6 +231,152 @@ export class VideoDownloader {
     }
 
     return { proxy: this.proxy };
+  }
+
+  /**
+   * Download a Google Drive file (or folder) through the external `gdown`
+   * binary. gdown names the destination after the remote file (the "To:" line
+   * of its output), so it is spawned with `cwd: outputDir` instead of passing
+   * `--output`, which folder downloads ignore anyway. The largest file in the
+   * output directory is then picked, mirroring the yt-dlp fallback resolution.
+   */
+  private async downloadWithGdown(options: DownloadVideoOptions, gdownBinary: string): Promise<DownloadedVideo> {
+    const { onProgress, outputDir, signal, url } = options;
+    await fsp.mkdir(outputDir, { recursive: true });
+
+    const args = [url];
+    if (isGoogleDriveFolderUrl(url)) {
+      args.push('--folder');
+    }
+
+    const child = spawn(gdownBinary, args, {
+      cwd: outputDir,
+      env: this.buildGdownEnv(options.noProxy === true),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    // gdown/tqdm write the progress bar and the "To:" line to stderr.
+    let output = '';
+    let outputTail = '';
+    const handleChunk = (chunk: Buffer) => {
+      const text = String(chunk);
+      output += text;
+      outputTail = (outputTail + text).slice(-GDOWN_OUTPUT_TAIL_LIMIT);
+      for (const line of text.split(/[\r\n]+/)) {
+        const progress = parseGdownProgressLine(line);
+        if (progress !== undefined) {
+          onProgress?.(progress);
+        }
+      }
+    };
+
+    child.stdout.on('data', handleChunk);
+    child.stderr.on('data', handleChunk);
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+      };
+
+      const onAbort = () => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
+        child.kill('SIGKILL');
+        reject(new DownloadCancelledError());
+      };
+
+      const timer = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
+        child.kill('SIGKILL');
+        reject(new Error(`Proses download gdown timeout setelah ${Math.round(this.downloadTimeoutMs / 1000)} detik.`));
+      }, this.downloadTimeoutMs);
+
+      child.on('error', (error) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
+        reject(error);
+      });
+
+      child.on('close', (code) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
+
+        if (code === 0) {
+          resolve();
+          return;
+        }
+
+        const detail = outputTail.trim();
+        reject(new Error(`gdown gagal (exit ${code ?? 'signal'})${detail ? `: ${detail}` : ''}`));
+      });
+
+      if (signal) {
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
+
+    const title = extractGdownTitle(output) ?? 'video';
+    const result = await this.resolveDownloadedVideoFromDirectory(outputDir, title);
+    onProgress?.({ status: 'finished', downloadedBytes: result.fileSize });
+    return result;
+  }
+
+  /**
+   * Environment for a single gdown run. gdown uses `requests`, which follows
+   * the HTTP_PROXY / HTTPS_PROXY / ALL_PROXY environment variables, so the
+   * configured yt-dlp proxy is applied the same way while the "no proxy"
+   * override strips all of them (matching yt-dlp's `--proxy ""` semantics).
+   */
+  private buildGdownEnv(noProxy: boolean): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...process.env, PYTHONUNBUFFERED: '1' };
+    const proxyKeys = [
+      'HTTP_PROXY',
+      'HTTPS_PROXY',
+      'ALL_PROXY',
+      'http_proxy',
+      'https_proxy',
+      'all_proxy',
+    ];
+
+    if (noProxy) {
+      for (const key of proxyKeys) {
+        delete env[key];
+      }
+      return env;
+    }
+
+    if (this.proxy) {
+      for (const key of proxyKeys) {
+        env[key] = this.proxy;
+      }
+    }
+
+    return env;
   }
 
   private async fetchBunkDownloaderPageUrl(url: string): Promise<string> {
@@ -773,6 +937,129 @@ function mapProgress(progress: YtDlpVideoProgress): VideoDownloadProgress {
     etaSeconds: progress.eta,
     percent: progress.percentage,
   };
+}
+
+let gdownBinaryCheck: Promise<string | undefined> | undefined;
+
+/**
+ * Detect the gdown binary once (spawn `gdown --version`), caching the result.
+ * Returns the binary name when gdown is on PATH, otherwise undefined.
+ * Exported for scripts/gdown-check.ts.
+ */
+export function resolveGdownBinary(): Promise<string | undefined> {
+  gdownBinaryCheck ??= new Promise<string | undefined>((resolve) => {
+    const child = spawn(GDOWN_BINARY, ['--version'], { stdio: 'ignore' });
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      resolve(undefined);
+    }, GDOWN_VERSION_TIMEOUT_MS);
+
+    child.on('error', () => {
+      clearTimeout(timer);
+      resolve(undefined);
+    });
+
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve(code === 0 ? GDOWN_BINARY : undefined);
+    });
+  });
+
+  return gdownBinaryCheck;
+}
+
+// Exported for scripts/gdown-check.ts.
+export function isGoogleDriveUrl(url: string): boolean {
+  try {
+    const { host } = new URL(url);
+    return (
+      host === 'drive.google.com' ||
+      host === 'docs.google.com' ||
+      host === 'drive.usercontent.google.com' ||
+      host.endsWith('.drive.google.com') ||
+      host.endsWith('.docs.google.com')
+    );
+  } catch {
+    return false;
+  }
+}
+
+// Exported for scripts/gdown-check.ts.
+export function isGoogleDriveFolderUrl(url: string): boolean {
+  return /^https?:\/\/(?:[a-z0-9-]+\.)*(?:drive|docs)\.google\.com\/drive(?:\/u\/\d+)?\/folders\//i.test(url);
+}
+
+/** Grab the destination path from the "To: <path>" lines gdown prints. */
+function extractGdownTitle(output: string): string | undefined {
+  let destination: string | undefined;
+  for (const match of output.matchAll(/^\s*To\s*:\s*(.+)\s*$/gm)) {
+    destination = match[1].trim();
+  }
+
+  if (!destination) {
+    return undefined;
+  }
+
+  const baseName = path.basename(destination);
+  return baseName.length > 0 ? baseName : undefined;
+}
+
+/**
+ * Parse a tqdm progress line printed by gdown, e.g.
+ * ` 12%|█▎        | 14.7M/499M [00:11<01:48, 4.48MB/s]`
+ * (sizes use SI prefixes, `MiB`-style suffixes stay 1024-based).
+ */
+export function parseGdownProgressLine(line: string): VideoDownloadProgress | undefined {
+  const percentMatch = line.match(/(\d{1,3}(?:\.\d+)?)%\s*\|/);
+  if (!percentMatch) {
+    return undefined;
+  }
+
+  const percent = Number(percentMatch[1]);
+  if (!Number.isFinite(percent)) {
+    return undefined;
+  }
+
+  const sizeMatch = line.match(/([\d.]+\s*[kKMGTP]?i?B?)\s*\/\s*([\d.]+\s*[kKMGTP]?i?B?)/);
+  const speedMatch = line.match(/([\d.]+\s*[kKMGTP]?i?B?)\/s/);
+  const etaMatch = line.match(/<\s*(\d+):(\d{2})(?::(\d{2}))?/);
+
+  return {
+    status: 'downloading',
+    downloadedBytes: sizeMatch ? parseSiSize(sizeMatch[1]) : undefined,
+    totalBytes: sizeMatch ? parseSiSize(sizeMatch[2]) : undefined,
+    speedBytesPerSecond: speedMatch ? parseSiSize(speedMatch[1]) : undefined,
+    etaSeconds: etaMatch ? parseEtaSeconds(etaMatch) : undefined,
+    percent,
+  };
+}
+
+const SI_PREFIX_MULTIPLIERS: Record<string, number> = { '': 1, k: 1_000, m: 1_000_000, g: 1_000_000_000, t: 1_000_000_000_000 };
+const IEC_PREFIX_MULTIPLIERS: Record<string, number> = { '': 1, k: 1_024, m: 1_048_576, g: 1_073_741_824, t: 1_099_511_627_776 };
+
+function parseSiSize(text: string): number | undefined {
+  const match = text.trim().match(/^([\d.]+)\s*([kKMGTP]?)(i?)B?$/);
+  if (!match) {
+    return undefined;
+  }
+
+  const value = Number(match[1]);
+  if (!Number.isFinite(value)) {
+    return undefined;
+  }
+
+  const multipliers = match[3].toLowerCase() === 'i' ? IEC_PREFIX_MULTIPLIERS : SI_PREFIX_MULTIPLIERS;
+  const multiplier = multipliers[match[2].toLowerCase()];
+  return value * multiplier;
+}
+
+function parseEtaSeconds(match: RegExpMatchArray): number | undefined {
+  // `<mm:ss` or `<h:mm:ss` (the part after "<" is the remaining time).
+  if (match[3] !== undefined) {
+    return Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+  }
+
+  return Number(match[1]) * 60 + Number(match[2]);
 }
 
 function isBunkrDownloaderPageUrl(url: string): boolean {

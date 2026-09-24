@@ -11,6 +11,7 @@ Bot ini menerima URL dari user, mencoba mengunduh videonya dengan `yt-dlp`, lalu
 - override tanpa proxy per pesan dari Telegram (`noproxy <link>` atau `/noproxy <link>`), berguna kalau proxy justru bikin link gagal
 - unduh Bunkr (`https://*.bunkr.*/file/<id>` atau `/f/<id>`) pakai custom downloader (detail API → sign token → media), dengan dukung progress & batalkan
 - URL album Bunkr (`/a/<id>`) otomatis diperluas menjadi bulk download video saja; gambar diabaikan
+- link Google Drive (`drive.google.com`, `docs.google.com/uc?id=...`) diunduh dengan binary `gdown` kalau tersedia (termasuk link folder via `--folder`), lengkap dengan progress; tanpa `gdown`, otomatis fallback ke `yt-dlp`
 - kirim kembali memakai `sendVideo` + `supports_streaming: true`
 - kalau ada link yang gagal, alasan errornya ditampilkan di pesan status (per link dan di ringkasan akhir), bukan hanya jumlah keberhasilan/gagal
 - auto cleanup file sementara
@@ -129,6 +130,15 @@ Detail teknis:
 - Bot API standar hanya bisa mengunduh file sampai **20 MB**. Kalau video yang di-reply lebih besar dari itu dan bot memakai Bot API standar, proses gagal cepat dengan pesan yang menyarankan `TELEGRAM_API_ROOT`. (Local Bot API server bisa mengunduh tanpa batas ukuran juga untuk audio ini.)
 - Audio dikirim memakai antrian media yang sama seperti video/screenshot sehingga urutan pesan per chat tetap konsisten.
 - Seperti unduhan video, proses `/audio` menampilkan progres (mengambil file → mengekstrak → mengirim) dan punya tombol ⏹ Hentikan Unduhan yang bisa dibatalkan lewat pesan status. Catatan: alur ini stateless dan tidak dicatat di tabel `jobs`/`job_items` (tabel itu khusus batch URL).
+
+## Google Drive dengan `gdown`
+Link Google Drive (`https://drive.google.com/file/d/.../view`, `.../open?id=...`, `.../uc?id=...`, `https://drive.usercontent.google.com/download?id=...`) otomatis diunduh memakai binary `gdown` **jika binary tersebut tersedia di PATH**; kalau tidak ada, bot tetap mencoba lewat `yt-dlp` seperti biasa.
+
+- Link folder (`https://drive.google.com/drive/folders/...`) didukung lewat flag `--folder` gdown
+- Progress (persentase, ukuran, kecepatan, ETA) dibaca dari output tqdm gdown dan ditampilkan di pesan status, seperti download biasa
+- Timeout (`DOWNLOAD_TIMEOUT_MS`) dan tombol ⏹ Hentikan Unduhan juga berlaku untuk proses gdown
+- Proxy `YTDLP_PROXY` diteruskan ke gdown lewat env `HTTP_PROXY`/`HTTPS_PROXY`; override `noproxy <link>` melepas semua env proxy untuk proses gdown
+- Image Docker sudah meng-install `gdown` otomatis; kalau menjalankan bot di luar Docker, pasang sendiri: `pip install gdown` atau `pipx install gdown`
 
 ## Override tanpa proxy dari pesan Telegram
 Kalau ada link yang justru gagal karena proxinya, user bisa mematikan proxy untuk link tersebut langsung dari pesan tanpa mengubah konfigurasi server:
