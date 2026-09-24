@@ -245,20 +245,71 @@ export class VideoDownloader {
     const { onProgress, outputDir, signal, url } = options;
     await fsp.mkdir(outputDir, { recursive: true });
 
-    const args = [url];
+    const baseArgs: string[] = [];
     if (isGoogleDriveFolderUrl(url)) {
-      args.push('--folder');
+      baseArgs.push('--folder');
     }
 
-    const child = spawn(gdownBinary, args, {
-      cwd: outputDir,
-      env: this.buildGdownEnv(options.noProxy === true),
+    const run = (extraArgs: string[]) =>
+      this.runGdownProcess({
+        gdownBinary,
+        args: [url, ...baseArgs, ...extraArgs],
+        outputDir,
+        noProxy: options.noProxy === true,
+        onProgress,
+        signal,
+      });
+
+    // --continue resumes the leftover .part file from an interrupted run and
+    // --retries rides out transient connection drops, which matters for the
+    // multi-GB files Google Drive serves.
+    let runResult = await run(['--continue', '--retries', '5']);
+
+    // Older gdown versions do not know those flags: retry once with plain
+    // arguments so a legacy binary keeps working.
+    if (runResult.code !== 0 && /unrecognized arguments/i.test(runResult.output)) {
+      console.log('[gdown] legacy binary detected, retrying without --continue/--retries');
+      runResult = await run([]);
+    }
+
+    if (runResult.code !== 0) {
+      const detail = extractGdownErrorDetail(runResult.outputTail);
+      throw new Error(`gdown gagal (exit ${runResult.code ?? 'signal'})${detail ? `: ${detail}` : ''}`);
+    }
+
+    const title = extractGdownTitle(runResult.output) ?? 'video';
+    const result = await this.resolveDownloadedVideoFromDirectory(outputDir, title);
+    // Completed: any leftover .part file from earlier failed attempts is dead
+    // weight now (partial files can be many GB).
+    await cleanupGdownPartials(outputDir);
+    onProgress?.({ status: 'finished', downloadedBytes: result.fileSize });
+    return result;
+  }
+
+  /**
+   * Spawn one gdown run and wait for it to finish, streaming tqdm progress
+   * lines to `onProgress`. Resolves with the exit code and the collected
+   * output instead of rejecting on a non-zero exit, so the caller decides how
+   * to report (or retry) the failure. Aborts and spawn errors still reject.
+   */
+  private async runGdownProcess(options: {
+    gdownBinary: string;
+    args: string[];
+    outputDir: string;
+    noProxy: boolean;
+    onProgress?: (progress: VideoDownloadProgress) => void;
+    signal?: AbortSignal;
+  }): Promise<{ code: number | null; output: string; outputTail: string }> {
+    const child = spawn(options.gdownBinary, options.args, {
+      cwd: options.outputDir,
+      env: this.buildGdownEnv(options.noProxy),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
     // gdown/tqdm write the progress bar and the "To:" line to stderr.
     let output = '';
     let outputTail = '';
+    let exitCode: number | null = null;
     const handleChunk = (chunk: Buffer) => {
       const text = String(chunk);
       output += text;
@@ -266,7 +317,7 @@ export class VideoDownloader {
       for (const line of text.split(/[\r\n]+/)) {
         const progress = parseGdownProgressLine(line);
         if (progress !== undefined) {
-          onProgress?.(progress);
+          options.onProgress?.(progress);
         }
       }
     };
@@ -279,7 +330,7 @@ export class VideoDownloader {
 
       const cleanup = () => {
         clearTimeout(timer);
-        signal?.removeEventListener('abort', onAbort);
+        options.signal?.removeEventListener('abort', onAbort);
       };
 
       const onAbort = () => {
@@ -321,30 +372,21 @@ export class VideoDownloader {
 
         settled = true;
         cleanup();
-
-        if (code === 0) {
-          resolve();
-          return;
-        }
-
-        const detail = outputTail.trim();
-        reject(new Error(`gdown gagal (exit ${code ?? 'signal'})${detail ? `: ${detail}` : ''}`));
+        exitCode = code;
+        resolve();
       });
 
-      if (signal) {
-        if (signal.aborted) {
+      if (options.signal) {
+        if (options.signal.aborted) {
           onAbort();
           return;
         }
 
-        signal.addEventListener('abort', onAbort, { once: true });
+        options.signal.addEventListener('abort', onAbort, { once: true });
       }
     });
 
-    const title = extractGdownTitle(output) ?? 'video';
-    const result = await this.resolveDownloadedVideoFromDirectory(outputDir, title);
-    onProgress?.({ status: 'finished', downloadedBytes: result.fileSize });
-    return result;
+    return { code: exitCode, output, outputTail };
   }
 
   /**
@@ -1027,6 +1069,45 @@ export function isGoogleDriveUrl(url: string): boolean {
 // Exported for scripts/gdown-check.ts.
 export function isGoogleDriveFolderUrl(url: string): boolean {
   return /^https?:\/\/(?:[a-z0-9-]+\.)*(?:drive|docs)\.google\.com\/drive(?:\/u\/\d+)?\/folders\//i.test(url);
+}
+
+/**
+ * Pull the actual error message out of a failed gdown run: the output tail is
+ * dominated by tqdm progress frames, which are useless for the user. Keep
+ * meaningful lines (Access denied, quota, cannot retrieve, Python errors, ...)
+ * and cap the result so a chatty failure stays readable in Telegram.
+ */
+export function extractGdownErrorDetail(outputTail: string, maxLines = 3): string {
+  const meaningful = outputTail
+    .split(/[\r\n]+/)
+    .map((line) => line.trim())
+    .filter((line) => {
+      if (line.length === 0 || parseGdownProgressLine(line) !== undefined) {
+        return false;
+      }
+
+      return (
+        /^To\s*:/i.test(line) === false &&
+        !/^(Downloading|Processing|\[Warning\]|Warning:)/i.test(line)
+      );
+    });
+
+  // Keep the last meaningful lines: gdown prints the reason at the end.
+  const detail = meaningful.slice(-maxLines).join(' | ');
+  return detail.length > 300 ? `${detail.slice(0, 299)}…` : detail;
+}
+
+/**
+ * Remove leftover `*.part` files (gdown partial downloads) from the output
+ * directory once a download finished successfully.
+ */
+async function cleanupGdownPartials(outputDir: string): Promise<void> {
+  const entries = await fsp.readdir(outputDir).catch(() => []);
+  await Promise.all(
+    entries
+      .filter((entry) => entry.endsWith('.part'))
+      .map((entry) => fsp.rm(path.join(outputDir, entry), { force: true }).catch(() => undefined)),
+  );
 }
 
 /** Grab the destination path from the "To: <path>" lines gdown prints. */
