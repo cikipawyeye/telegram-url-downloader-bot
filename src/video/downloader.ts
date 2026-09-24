@@ -849,7 +849,7 @@ function isAbortError(error: unknown): boolean {
   return candidate.name === 'AbortError' || candidate.code === 'ERR_ABORTED';
 }
 
-function formatFetchError(error: unknown): string {
+export function formatFetchError(error: unknown): string {
   if (typeof error !== 'object' || error === null) {
     return String(error);
   }

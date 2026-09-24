@@ -9,6 +9,7 @@
  */
 import fsp from 'node:fs/promises';
 import { Bot, type Context, type Update } from 'grammy';
+import type { AudioMessageProcessor } from '../src/audio/process-audio-reply.js';
 import { YtDlp } from 'ytdlp-nodejs';
 import { BotDatabase } from '../src/storage/database.js';
 import { registerBotHandlers } from '../src/telegram/register-handlers.js';
@@ -371,7 +372,12 @@ async function checkHandlerWiring(): Promise<void> {
     },
   } as unknown as VideoMessageProcessor;
 
-  registerBotHandlers(bot, processor, db);
+  const audioProcessor = {
+    cancelDownload: () => false,
+    async process() {},
+  } as unknown as AudioMessageProcessor;
+
+  registerBotHandlers(bot, processor, db, audioProcessor);
   await bot.init();
 
   // /noproxy <link>: grammy hands the arguments over as ctx.match.

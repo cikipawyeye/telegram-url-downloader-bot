@@ -1,5 +1,5 @@
 import { InlineKeyboard, InputFile, type Bot, type Context } from 'grammy';
-import type { VideoScreenshot, VideoThumbnail } from '../video/utils.js';
+import { type VideoScreenshot, type VideoThumbnail } from '../video/utils.js';
 
 export type StatusMessage = {
   messageId: number;
@@ -62,8 +62,21 @@ export class TelegramNotifier {
     );
   }
 
-  async sendAccepted(): Promise<StatusMessage> {
-    const message = await this.ctx.reply('Link diterima. Sedang mencoba mendownload video...', {
+  async sendAudioReplyHint(): Promise<void> {
+    await this.ctx.reply(
+      [
+        'Balas (reply) pesan video yang dikirim bot, lalu ketik /audio untuk mengekstrak audionya.',
+        '',
+        'Contoh: reply video yang mau diambil audionya, lalu kirim /audio.',
+      ].join('\n'),
+      { reply_parameters: this.replyParameters() },
+    );
+  }
+
+  async sendAccepted(
+    text = 'Link diterima. Sedang mencoba mendownload video...',
+  ): Promise<StatusMessage> {
+    const message = await this.ctx.reply(text, {
       reply_parameters: this.replyParameters(),
     });
     this.lastStatusText = message.text;
@@ -199,6 +212,23 @@ export class TelegramNotifier {
     );
   }
 
+  async sendAudio(audio: {
+    filePath: string;
+    fileName: string;
+    title: string;
+    durationSeconds?: number;
+  }): Promise<void> {
+    await this.bot.api.sendAudio(
+      this.getChatId(),
+      new InputFile(audio.filePath, audio.fileName),
+      {
+        title: audio.title,
+        duration: normalizeAudioDuration(audio.durationSeconds),
+        reply_parameters: this.replyParameters(),
+      },
+    );
+  }
+
   async deleteStatus(statusMessage: StatusMessage): Promise<void> {
     this.clearPendingProgress();
     this.statusMessageClosed = true;
@@ -318,3 +348,13 @@ export class TelegramNotifier {
 function isMessageNotModifiedError(error: unknown): boolean {
   return error instanceof Error && error.message.includes('message is not modified');
 }
+
+/** Telegram waits for a whole number of seconds and rejects negative values. */
+function normalizeAudioDuration(durationSeconds: number | undefined): number | undefined {
+  if (durationSeconds === undefined || !Number.isFinite(durationSeconds) || durationSeconds < 0) {
+    return undefined;
+  }
+
+  return Math.round(durationSeconds);
+}
+

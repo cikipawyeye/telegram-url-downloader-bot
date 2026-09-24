@@ -7,6 +7,7 @@ Bot ini menerima URL dari user, mencoba mengunduh videonya dengan `yt-dlp`, lalu
 - bulk download hingga 10 URL dalam satu pesan (diproses berurutan)
 - webhook-ready untuk deployment
 - download dengan `yt-dlp`
+- perintah `/audio`: balas (reply) pesan video dari bot untuk mengekstrak audionya lalu mengirimnya kembali sebagai MP3
 - override tanpa proxy per pesan dari Telegram (`noproxy <link>` atau `/noproxy <link>`), berguna kalau proxy justru bikin link gagal
 - unduh Bunkr (`https://*.bunkr.*/file/<id>` atau `/f/<id>`) pakai custom downloader (detail API → sign token → media), dengan dukung progress & batalkan
 - URL album Bunkr (`/a/<id>`) otomatis diperluas menjadi bulk download video saja; gambar diabaikan
@@ -24,10 +25,11 @@ Struktur kode sekarang dibuat lebih langsung per kebutuhan fitur, bukan per laye
 ```text
 src/
   index.ts                  # bootstrap aplikasi
+  audio/                    # ekstraksi audio dari video (ffmpeg) dan alur /audio
   config.ts                 # load environment config
   http/                     # Express app dan endpoint health check
   storage/                  # workspace temp file
-  telegram/                 # handler dan notifier Telegram
+  telegram/                 # handler, notifier, dan pengambil file dari Telegram
   video/                    # download, screenshot, util, dan flow utama
 ```
 
@@ -117,6 +119,16 @@ sudo systemctl restart nama-service-aplikasi.service
 ```
 
 `socks5://` membuat resolusi DNS dilakukan oleh host. Jika ingin resolusi DNS juga melalui proxy dan versi `yt-dlp` yang terpasang mendukungnya, gunakan `socks5h://127.0.0.1:40000`.
+
+## Ekstrak audio dari video (`/audio`)
+Cara pakai: balas (**reply**) pesan video yang dikirim bot, lalu ketik `/audio`. Bot akan mengambil ulang video tersebut dari Telegram, mengekstrak track audionya menjadi MP3 (VBR ~190 kbps) memakai `ffmpeg`, lalu mengirimnya kembali sebagai audio dengan judul, nama file, dan durasi yang benar.
+
+Detail teknis:
+- Pesan balasan yang didukung: video (`sendVideo`) dan dokumen bertipe video; kalau bukan keduanya, bot menjawab petunjuk pemakaian.
+- Video diambil lewat `getFile`: dengan local Bot API server (`TELEGRAM_API_ROOT`), `file_path` adalah lokasi file di server sehingga langsung disalin dari disk; tanpa itu (Bot API standar), file diunduh lewat HTTP dari `<API_ROOT>/file/bot<TOKEN>/<path>`.
+- Bot API standar hanya bisa mengunduh file sampai **20 MB**. Kalau video yang di-reply lebih besar dari itu dan bot memakai Bot API standar, proses gagal cepat dengan pesan yang menyarankan `TELEGRAM_API_ROOT`. (Local Bot API server bisa mengunduh tanpa batas ukuran juga untuk audio ini.)
+- Audio dikirim memakai antrian media yang sama seperti video/screenshot sehingga urutan pesan per chat tetap konsisten.
+- Seperti unduhan video, proses `/audio` menampilkan progres (mengambil file → mengekstrak → mengirim) dan punya tombol ⏹ Hentikan Unduhan yang bisa dibatalkan lewat pesan status. Catatan: alur ini stateless dan tidak dicatat di tabel `jobs`/`job_items` (tabel itu khusus batch URL).
 
 ## Override tanpa proxy dari pesan Telegram
 Kalau ada link yang justru gagal karena proxinya, user bisa mematikan proxy untuk link tersebut langsung dari pesan tanpa mengubah konfigurasi server:

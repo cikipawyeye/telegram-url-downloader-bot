@@ -2,11 +2,14 @@ import 'dotenv/config';
 import { hydrateFiles } from '@grammyjs/files';
 import { Bot, type Context, webhookCallback } from 'grammy';
 import { YtDlp } from 'ytdlp-nodejs';
+import { AudioExtractor } from './audio/extractor.js';
+import { AudioMessageProcessor } from './audio/process-audio-reply.js';
 import { loadConfig } from './config.js';
 import { createHttpApp } from './http/create-app.js';
 import { BotDatabase } from './storage/database.js';
 import { WorkspaceManager } from './storage/workspace.js';
 import { registerBotHandlers, BOT_COMMANDS } from './telegram/register-handlers.js';
+import { TelegramMediaDownloader } from './telegram/telegram-media.js';
 import { VideoDownloader } from './video/downloader.js';
 import { VideoConverter } from './video/converter.js';
 import { VideoMessageProcessor } from './video/process-message.js';
@@ -24,7 +27,14 @@ async function bootstrap(): Promise<void> {
       : undefined,
   });
 
-  bot.api.config.use(hydrateFiles(config.botToken));
+  // apiRoot must be passed along, otherwise file downloads would go to the
+  // standard Bot API even when a local Bot API server is configured.
+  bot.api.config.use(
+    hydrateFiles(
+      config.botToken,
+      config.telegramApiRoot ? { apiRoot: config.telegramApiRoot } : undefined,
+    ),
+  );
 
   const workspaceManager = new WorkspaceManager(config.downloadDir);
   await workspaceManager.prepareRoot();
@@ -55,7 +65,23 @@ async function bootstrap(): Promise<void> {
     db,
   });
 
-  registerBotHandlers(bot, videoMessageProcessor, db);
+  const audioMessageProcessor = new AudioMessageProcessor({
+    mediaDownloader: new TelegramMediaDownloader({
+      api: bot.api,
+      botToken: config.botToken,
+      apiRoot: config.telegramApiRoot,
+      downloadTimeoutMs: config.downloadTimeoutMs,
+    }),
+    audioExtractor: new AudioExtractor({
+      // Audio encoding is much faster than a full video download; cap the job
+      // so a broken input cannot hang for the whole download timeout.
+      commandTimeoutMs: Math.min(config.downloadTimeoutMs, 900_000),
+    }),
+    workspaceManager,
+    maxFileSizeBytes: config.maxFileSizeBytes,
+  });
+
+  registerBotHandlers(bot, videoMessageProcessor, db, audioMessageProcessor);
 
   const app = createHttpApp(config.downloadDir);
   const webhookPath = `/telegram/webhook/${config.webhookSecret}`;
