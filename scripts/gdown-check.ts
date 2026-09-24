@@ -7,18 +7,33 @@
  *
  * Run with: npx tsx scripts/gdown-check.ts
  */
+import { existsSync } from 'node:fs';
 import fsp from 'node:fs/promises';
+import path from 'node:path';
 import type { YtDlp } from 'ytdlp-nodejs';
-import {
+
+// Shorten the binary re-probe cooldown and hide only the directories that
+// contain a real gdown (not the whole PATH — the fake binary still needs
+// `#!/usr/bin/env node` to resolve): these must be in place before the module
+// under test loads, so the import is dynamic.
+const ORIGINAL_PATH = process.env.PATH ?? '';
+const ORIGINAL_DIRS = ORIGINAL_PATH.split(':').filter((dir) => dir.length > 0);
+const GDOWN_DIRS = ORIGINAL_DIRS.filter((dir) => existsSync(path.join(dir, 'gdown')));
+const HIDDEN_GDOWN_PATH = ORIGINAL_DIRS.filter((dir) => !GDOWN_DIRS.includes(dir)).join(':');
+process.env.GDOWN_BINARY_RECHECK_MS = '150';
+process.env.PATH = HIDDEN_GDOWN_PATH;
+
+const {
   DownloadCancelledError,
   isGoogleDriveFolderUrl,
   isGoogleDriveUrl,
   parseGdownProgressLine,
   resolveGdownBinary,
   VideoDownloader,
-} from '../src/video/downloader.js';
+} = await import('../src/video/downloader.js');
 
 const TMP_DIR = '/tmp/gdown-check';
+const GDOWN_NAME = 'gdown';
 
 function check(condition: boolean, message: string): void {
   if (!condition) {
@@ -133,6 +148,7 @@ const FAKE_GDOWN = `#!/usr/bin/env node
 const fs = require('node:fs');
 
 if (process.argv.includes('--version')) {
+  fs.appendFileSync('/tmp/gdown-check/probe-count', 'x');
   process.exit(0);
 }
 
@@ -156,9 +172,11 @@ async function checkDownloadWithFakeGdown(): Promise<void> {
   await fsp.rm(outputDir, { recursive: true, force: true });
   await fsp.writeFile(`${binDir}/gdown`, FAKE_GDOWN, { mode: 0o755 });
 
-  // Make the fake binary win the PATH resolution; the real binary name stays
-  // the same, so download() still goes through its normal routing.
+  // Make the fake binary win the PATH resolution; the binary name stays the
+  // same, so download() still goes through its normal routing. Wait out the
+  // (shortened) recheck cooldown so the fresh probe resolves the fake binary.
   process.env.PATH = `${binDir}:${process.env.PATH}`;
+  await wait(200);
 
   const downloader = new VideoDownloader({
     downloadTimeoutMs: 60_000,
@@ -217,14 +235,69 @@ async function checkDownloadWithFakeGdown(): Promise<void> {
   await fsp.rm(TMP_DIR, { recursive: true, force: true });
 }
 
+async function wait(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * The binary probe must stay cached for the cooldown window but re-probe after
+ * it elapses — this is how a bot already running under systemd picks up a
+ * gdown installed (or removed) later, without a restart.
+ */
+async function checkBinaryRecheck(): Promise<void> {
+  const binDir = `${TMP_DIR}/bin`;
+  await fsp.mkdir(binDir, { recursive: true });
+  await fsp.writeFile(`${binDir}/gdown`, FAKE_GDOWN, { mode: 0o755 });
+
+  // The default PATH was hidden at module load: the first probe must miss.
+  const missing = await resolveGdownBinary();
+  check(missing === undefined, `a missing gdown must probe to undefined: ${missing}`);
+
+  // Installing gdown mid-run must stay unnoticed within the cooldown window.
+  process.env.PATH = `${binDir}:${HIDDEN_GDOWN_PATH}`;
+  const cached = await resolveGdownBinary();
+  check(cached === undefined, `the negative probe must stay cached during the cooldown: ${cached}`);
+
+  // After the cooldown elapses, the next request picks the new binary up.
+  await wait(200);
+  const found = await resolveGdownBinary();
+  check(found === GDOWN_NAME, `a gdown installed while running must be picked up: ${found}`);
+
+  // ...and the fresh result is cached again until the next cooldown.
+  await resolveGdownBinary();
+  const probeCount = await fsp.readFile(`${TMP_DIR}/probe-count`, 'utf8');
+  check(probeCount.length === 1, `the positive result must be cached again (expected 1 probe, saw ${probeCount.length})`);
+
+  // Removing gdown again is picked up the same way after the cooldown.
+  process.env.PATH = HIDDEN_GDOWN_PATH;
+  await wait(200);
+  const removed = await resolveGdownBinary();
+  check(removed === undefined, `a gdown removed while running must disappear after the cooldown: ${removed}`);
+
+  // An explicit GDOWN_BINARY_PATH works even when gdown is nowhere on PATH —
+  // this is what makes a pip --user install (~/.local/bin) usable under
+  // systemd, where the service PATH does not include it.
+  process.env.GDOWN_BINARY_PATH = `${binDir}/gdown`;
+  await wait(200);
+  const viaPath = await resolveGdownBinary();
+  check(viaPath === `${binDir}/gdown`, `an explicit GDOWN_BINARY_PATH must be detected: ${viaPath}`);
+
+  delete process.env.GDOWN_BINARY_PATH;
+  await fsp.rm(`${TMP_DIR}/probe-count`, { force: true });
+}
+
 async function main(): Promise<void> {
   checkUrlDetection();
   checkProgressParsing();
+  await checkBinaryRecheck();
+  await checkDownloadWithFakeGdown();
 
+  // Restore the original environment so the final probe reports the real
+  // binary (and wait out the shortened cooldown so the cache is refreshed).
+  await wait(200);
+  process.env.PATH = ORIGINAL_PATH;
   const gdownBinary = await resolveGdownBinary();
   console.log(`gdown binary probe: ${gdownBinary ?? 'not found (yt-dlp fallback stays active)'}`);
-
-  await checkDownloadWithFakeGdown();
 
   console.log('ALL CHECKS PASSED');
 }

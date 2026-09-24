@@ -939,16 +939,57 @@ function mapProgress(progress: YtDlpVideoProgress): VideoDownloadProgress {
   };
 }
 
-let gdownBinaryCheck: Promise<string | undefined> | undefined;
+type GdownBinaryProbe = {
+  at: number;
+  promise: Promise<string | undefined>;
+};
+
+let gdownBinaryProbe: GdownBinaryProbe | undefined;
+
+const DEFAULT_GDOWN_BINARY_RECHECK_MS = 5 * 60_000;
 
 /**
- * Detect the gdown binary once (spawn `gdown --version`), caching the result.
- * Returns the binary name when gdown is on PATH, otherwise undefined.
- * Exported for scripts/gdown-check.ts.
+ * How long a gdown availability probe stays cached before the next Drive link
+ * triggers a fresh `gdown --version`. This is what lets a bot that already
+ * runs under systemd pick up a gdown installed (or removed) later, without a
+ * restart. Override with GDOWN_BINARY_RECHECK_MS (0 = probe on every request).
+ */
+function gdownBinaryRecheckMs(): number {
+  const raw = Number(process.env.GDOWN_BINARY_RECHECK_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_GDOWN_BINARY_RECHECK_MS;
+}
+
+/**
+ * Detect the gdown binary with `gdown --version`, caching the result for the
+ * recheck cooldown. Returns the binary name when gdown is on PATH, otherwise
+ * undefined. Exported for scripts/gdown-check.ts.
  */
 export function resolveGdownBinary(): Promise<string | undefined> {
-  gdownBinaryCheck ??= new Promise<string | undefined>((resolve) => {
-    const child = spawn(GDOWN_BINARY, ['--version'], { stdio: 'ignore' });
+  const probe = gdownBinaryProbe;
+
+  if (probe !== undefined && Date.now() - probe.at < gdownBinaryRecheckMs()) {
+    return probe.promise;
+  }
+
+  const promise = spawnGdownVersionProbe();
+  gdownBinaryProbe = { at: Date.now(), promise };
+  return promise;
+}
+
+/**
+ * Optional explicit path to the gdown binary via GDOWN_BINARY_PATH, e.g.
+ * /home/user/.local/bin/gdown for a pip --user install running under systemd,
+ * where ~/.local/bin is not on the service PATH. Falls back to plain `gdown`
+ * resolved through PATH. Read per call so the environment stays override-able.
+ */
+function configuredGdownBinary(): string {
+  const configured = process.env.GDOWN_BINARY_PATH?.trim();
+  return configured !== undefined && configured.length > 0 ? configured : GDOWN_BINARY;
+}
+
+function spawnGdownVersionProbe(): Promise<string | undefined> {
+  return new Promise<string | undefined>((resolve) => {
+    const child = spawn(configuredGdownBinary(), ['--version'], { stdio: 'ignore' });
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
       resolve(undefined);
@@ -961,11 +1002,9 @@ export function resolveGdownBinary(): Promise<string | undefined> {
 
     child.on('close', (code) => {
       clearTimeout(timer);
-      resolve(code === 0 ? GDOWN_BINARY : undefined);
+      resolve(code === 0 ? configuredGdownBinary() : undefined);
     });
   });
-
-  return gdownBinaryCheck;
 }
 
 // Exported for scripts/gdown-check.ts.

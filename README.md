@@ -136,6 +136,8 @@ Link Google Drive (`https://drive.google.com/file/d/.../view`, `.../open?id=...`
 
 - Link folder (`https://drive.google.com/drive/folders/...`) didukung lewat flag `--folder` gdown
 - Progress (persentase, ukuran, kecepatan, ETA) dibaca dari output tqdm gdown dan ditampilkan di pesan status, seperti download biasa
+- Ketersediaan binary di-probe ulang tiap **5 menit** (bisa diubah lewat env `GDOWN_BINARY_RECHECK_MS`, `0` = tiap request), jadi bot yang sudah berjalan (mis. di systemd) otomatis mendeteksi `gdown` yang di-install/dihapus kemudian **tanpa restart**; setelah cooldown lewat, link Drive berikutnya langsung memakai binary baru
+- Kalau `gdown` tidak berada di PATH service — mis. install `pip install --user gdown` (`~/.local/bin/gdown`) padahal systemd tidak memasukkan `~/.local/bin` ke PATH — set env `GDOWN_BINARY_PATH=/home/user/.local/bin/gdown` di `.env`; alternatif lain: symlink ke `/usr/local/bin` atau tambah `Environment="PATH=/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"` di unit systemd
 - Timeout (`DOWNLOAD_TIMEOUT_MS`) dan tombol ⏹ Hentikan Unduhan juga berlaku untuk proses gdown
 - Proxy `YTDLP_PROXY` diteruskan ke gdown lewat env `HTTP_PROXY`/`HTTPS_PROXY`; override `noproxy <link>` melepas semua env proxy untuk proses gdown
 - Image Docker sudah meng-install `gdown` otomatis; kalau menjalankan bot di luar Docker, pasang sendiri: `pip install gdown` atau `pipx install gdown`
