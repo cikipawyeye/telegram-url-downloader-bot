@@ -241,6 +241,7 @@ export class VideoDownloader {
    * output directory is then picked, mirroring the yt-dlp fallback resolution.
    */
   private async downloadWithGdown(options: DownloadVideoOptions, gdownBinary: string): Promise<DownloadedVideo> {
+    console.log(`[gdown] routing ${options.url} via ${gdownBinary}`);
     const { onProgress, outputDir, signal, url } = options;
     await fsp.mkdir(outputDir, { recursive: true });
 
