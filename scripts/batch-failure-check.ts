@@ -107,6 +107,8 @@ function buildProcessor(): VideoMessageProcessor {
     screenshotCount: 0,
     sendVideoInAlbum: false,
     reencodeAnamorphic: false,
+    downloadRetries: 2,
+    downloadRetryBackoffMs: 5,
   });
 }
 

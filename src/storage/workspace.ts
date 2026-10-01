@@ -80,13 +80,32 @@ export class WorkspaceManager {
     this.sweepTimer = null;
   }
 
-  async create(userId: string): Promise<DownloadWorkspace> {
+  async create(userId: string, options: { reuseDir?: string } = {}): Promise<DownloadWorkspace> {
+    // A failed/cancelled job leaves its workspace behind for a resume attempt.
+    // Reuse it when it still exists (the orphan sweep may have removed it in
+    // the meantime), but only when it really lives under this root dir.
+    if (options.reuseDir !== undefined && this.isInsideRoot(options.reuseDir)) {
+      const isDirectory = await fsp
+        .stat(options.reuseDir)
+        .then((entry) => entry.isDirectory())
+        .catch(() => false);
+
+      if (isDirectory) {
+        return { dirPath: options.reuseDir };
+      }
+    }
+
     const jobId = `${Date.now()}-${userId}-${crypto.randomUUID()}`;
     const dirPath = path.join(this.rootDir, jobId);
 
     await fsp.mkdir(dirPath, { recursive: true });
 
     return { dirPath };
+  }
+
+  private isInsideRoot(candidatePath: string): boolean {
+    const resolved = path.resolve(candidatePath);
+    return resolved === this.rootDir || resolved.startsWith(`${this.rootDir}${path.sep}`);
   }
 
   async remove(workspace: DownloadWorkspace): Promise<void> {

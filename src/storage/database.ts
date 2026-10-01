@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const MIGRATIONS: Array<{ version: number; sql: string }> = [
   {
@@ -80,6 +80,16 @@ const MIGRATIONS: Array<{ version: number; sql: string }> = [
       -- Per URL: the user asked to bypass the yt-dlp proxy for this link
       -- (the "noproxy" marker / /noproxy in the Telegram message).
       ALTER TABLE job_items ADD COLUMN no_proxy INTEGER NOT NULL DEFAULT 0;
+    `,
+  },
+  {
+    version: 3,
+    sql: `
+      -- Per URL: workspace directory kept after a failed/cancelled download so
+      -- a resend of the same file can resume the leftover partial instead of
+      -- starting from zero. NULL once the item succeeds or the partial is
+      -- claimed by a newer attempt.
+      ALTER TABLE job_items ADD COLUMN resume_dir TEXT;
     `,
   },
 ];
@@ -231,6 +241,57 @@ export class BotDatabase {
       `UPDATE job_items SET status = 'cancelled', finished_at = strftime('%s', 'now')
        WHERE job_id = ? AND status = 'pending'`,
     ).run(jobId);
+  }
+
+  // ---- download resume -----------------------------------------------------
+
+  /**
+   * Record the workspace directory that holds a partial download for this item.
+   * Kept after failure/cancel so a resend of the same file can resume it.
+   */
+  setItemResumeDir(itemId: number, resumeDir: string): void {
+    this.db.prepare('UPDATE job_items SET resume_dir = ? WHERE id = ?').run(resumeDir, itemId);
+  }
+
+  clearItemResume(itemId: number): void {
+    this.db.prepare('UPDATE job_items SET resume_dir = NULL WHERE id = ?').run(itemId);
+  }
+
+  /**
+   * Find and claim the most recent failed/cancelled item in this chat whose URL
+   * has the same stable file identity, returning its leftover workspace.
+   *
+   * The claim (`resume_dir = NULL`) only succeeds for one caller, so two
+   * concurrent batches cannot resume the same partial. `isMatch` is injected by
+   * the caller because identity extraction lives in the video layer.
+   */
+  takeResumableItem(chatId: number, isMatch: (url: string) => boolean): { itemId: number; resumeDir: string } | undefined {
+    const rows = this.db
+      .prepare(
+        `SELECT job_items.id AS id, job_items.url AS url, job_items.resume_dir AS resume_dir
+           FROM job_items JOIN jobs ON jobs.id = job_items.job_id
+          WHERE jobs.chat_id = ? AND job_items.resume_dir IS NOT NULL
+            AND job_items.status IN ('failed', 'cancelled')
+          ORDER BY job_items.id DESC
+          LIMIT 50`,
+      )
+      .all(chatId) as Array<{ id: number; url: string; resume_dir: string }>;
+
+    for (const row of rows) {
+      if (!isMatch(row.url)) {
+        continue;
+      }
+
+      const claim = this.db
+        .prepare('UPDATE job_items SET resume_dir = NULL WHERE id = ? AND resume_dir IS NOT NULL')
+        .run(row.id);
+
+      if (claim.changes > 0) {
+        return { itemId: row.id, resumeDir: row.resume_dir };
+      }
+    }
+
+    return undefined;
   }
 
   private migrate(): void {

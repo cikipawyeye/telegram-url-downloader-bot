@@ -101,6 +101,50 @@ export function parseVideoRequestItems(text: string): VideoRequestItem[] {
 }
 
 
+/**
+ * Stable identity of a downloadable file, used to match a retry or a resent
+ * link to an existing partial download.
+ *
+ * Signed/expiring URLs (Bunkr `token`/`ex` params, Drive confirm tokens, ...)
+ * change between attempts even though they point at the same bytes, so the
+ * identity is derived from the durable file id inside the URL whenever
+ * possible. When no such id exists, the plain URL is used as-is.
+ */
+export function downloadIdentity(url: string): string {
+  const trimmed = url.trim();
+
+  const bunkrId = extractBunkrFileIdentity(trimmed);
+  if (bunkrId !== undefined) {
+    return `bunkr:${bunkrId}`;
+  }
+
+  const driveId = extractGoogleDriveFileIdentity(trimmed);
+  if (driveId !== undefined) {
+    return `gdrive:${driveId}`;
+  }
+
+  return trimmed;
+}
+
+function extractBunkrFileIdentity(url: string): string | undefined {
+  const match = url.match(/^https?:\/\/(?:[a-z0-9-]+\.)*bunkr\.[a-z]{2,}\/(?:f|file)\/([^/?#]+)/i);
+  return match ? match[1] : undefined;
+}
+
+function extractGoogleDriveFileIdentity(url: string): string | undefined {
+  if (!/^https?:\/\/(?:[a-z0-9-]+\.)*drive\.google\.com\//i.test(url)) {
+    return undefined;
+  }
+
+  const pathMatch = url.match(/\/file\/d\/([^/?#]+)/i);
+  if (pathMatch) {
+    return pathMatch[1];
+  }
+
+  const idMatch = url.match(/[?&]id=([^&\s#]+)/i);
+  return idMatch ? idMatch[1] : undefined;
+}
+
 export function buildDeliveryFileName(filePath: string, title: string): string {
   const extension = path.extname(filePath);
   const fallbackBaseName = path.basename(filePath, extension);

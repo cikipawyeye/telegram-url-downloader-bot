@@ -62,6 +62,8 @@ async function bootstrap(): Promise<void> {
     screenshotCount: config.screenshotCount,
     sendVideoInAlbum: config.sendVideoInAlbum,
     reencodeAnamorphic: config.reencodeAnamorphic,
+    downloadRetries: config.downloadRetries,
+    downloadRetryBackoffMs: config.downloadRetryBackoffMs,
     db,
   });
 

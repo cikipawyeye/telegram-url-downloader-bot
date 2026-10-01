@@ -95,12 +95,20 @@ async function checkYtDlpArguments(): Promise<void> {
 
   const [direct, proxied] = captured;
   check(direct.proxy === undefined, `a direct download must not pass a proxy: ${JSON.stringify(direct.proxy)}`);
+  const directProxyIndex = direct.rawArgs?.indexOf('--proxy') ?? -1;
   check(
-    Array.isArray(direct.rawArgs) && direct.rawArgs[0] === '--proxy' && direct.rawArgs[1] === '',
+    directProxyIndex !== -1 && direct.rawArgs?.[directProxyIndex + 1] === '',
     `a direct download must ask yt-dlp for an empty --proxy: ${JSON.stringify(direct.rawArgs)}`,
   );
+  check(
+    direct.rawArgs?.includes('--continue') === true && direct.rawArgs?.includes('--retries') === true,
+    `a download must ask yt-dlp to keep and resume partial files: ${JSON.stringify(direct.rawArgs)}`,
+  );
   check(proxied.proxy === PROXY_URL, `a normal download must keep the proxy: ${JSON.stringify(proxied.proxy)}`);
-  check(proxied.rawArgs === undefined, `a normal download must not touch --proxy: ${JSON.stringify(proxied.rawArgs)}`);
+  check(
+    proxied.rawArgs?.includes('--continue') === true && !proxied.rawArgs?.includes('--proxy'),
+    `a normal download must keep the resume flags without a --proxy override: ${JSON.stringify(proxied.rawArgs)}`,
+  );
 
   // Render the real command line: an empty --proxy value is yt-dlp's documented
   // "connect directly" switch.
@@ -238,8 +246,8 @@ async function checkDownloadFlow(): Promise<void> {
 
   const db = new BotDatabase(`${TMP_DIR}/bot.db`);
   check(
-    Number(db.db.prepare('PRAGMA user_version').get()!.user_version) === 2,
-    'the job_items.no_proxy migration should have been applied',
+    Number(db.db.prepare('PRAGMA user_version').get()!.user_version) === 3,
+    'the job_items migrations (no_proxy, resume_dir) should have been applied',
   );
 
   const downloads: CapturedDownload[] = [];

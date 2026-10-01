@@ -218,19 +218,27 @@ export class VideoDownloader {
   }
 
   /**
-   * Proxy flags for a single yt-dlp run.
+   * Proxy + resume flags for a single yt-dlp run.
    *
    * yt-dlp also honours the HTTP_PROXY / HTTPS_PROXY / ALL_PROXY environment
    * variables, so simply leaving `--proxy` out is not enough to guarantee a
    * direct connection: `--proxy ""` is yt-dlp's documented "connect directly"
    * switch and it overrides those environment variables as well.
+   *
+   * The resume flags make each retry of the same output directory continue the
+   * leftover `.part` file instead of restarting: `--continue` resumes partial
+   * downloads, `--retries`/`--fragment-retries` ride out transient connection
+   * drops inside a single run, and `--socket-timeout` prevents a hung socket
+   * from stalling until the whole-process timeout kills the job.
    */
   private buildProxyOptions(noProxy: boolean): { proxy?: string; rawArgs?: string[] } {
+    const resumeArgs = ['--continue', '--retries', '10', '--fragment-retries', '10', '--socket-timeout', '30'];
+
     if (noProxy) {
-      return { rawArgs: ['--proxy', ''] };
+      return { rawArgs: [...resumeArgs, '--proxy', ''] };
     }
 
-    return { proxy: this.proxy };
+    return { proxy: this.proxy, rawArgs: resumeArgs };
   }
 
   /**
@@ -455,6 +463,11 @@ export class VideoDownloader {
     const extension = path.extname(detail.original) || '.mp4';
     const outputPath = path.join(outputDir, `bunk-video${extension}`);
 
+    // A resumed workspace may hold a partial from an earlier attempt whose
+    // server-side file name changed (different extension). That partial cannot
+    // be resumed and would only waste disk space.
+    await removeStaleBunkPartials(outputDir, path.basename(outputPath));
+
     const fileSize = await this.downloadBunkFile({
       url: detail.downloadUrl,
       outputPath,
@@ -635,62 +648,16 @@ export class VideoDownloader {
     onProgress?: (progress: VideoDownloadProgress) => void;
     isTimedOut: () => boolean;
   }): Promise<number> {
-    let response: IncomingMessage;
-    try {
-      response = await this.bunkRawRequest(
-        new URL(options.url),
-        'GET',
-        { ...BUNKR_BROWSER_HEADERS, accept: 'video/*' },
-        undefined,
-        options.signal,
-      );
-    } catch (error) {
-      throw this.mapBunkHttpError(error, options.isTimedOut(), options.url, this.downloadTimeoutMs);
-    }
-
-    const status = response.statusCode ?? 0;
-    if (status < 200 || status >= 300) {
-      const sample = await readResponseBody(response).catch(() => '');
-      throw new Error(`Bunk unduh responde HTTP ${status}${sample ? `: ${sample.slice(0, 200)}` : ''}`);
-    }
-
-    const totalBytes = parseContentLength(String(response.headers['content-length'] ?? ''));
-    const started = Date.now();
-    let downloadedBytes = 0;
-    const file = await fsp.open(options.outputPath, 'w');
-
-    const emitProgress = () => {
-      if (options.onProgress === undefined) {
-        return;
-      }
-
-      const elapsedSeconds = Math.max(1, (Date.now() - started) / 1000);
-      const hasTotal = totalBytes !== undefined && totalBytes > 0;
-      options.onProgress({
-        status: 'downloading',
-        downloadedBytes,
-        totalBytes,
-        speedBytesPerSecond: downloadedBytes > 0 ? downloadedBytes / elapsedSeconds : undefined,
-        percent: hasTotal ? (downloadedBytes / totalBytes) * 100 : undefined,
-      });
-    };
-
-    try {
-      for await (const chunk of response) {
-        await file.writeFile(chunk);
-        downloadedBytes += chunk.length;
-        emitProgress();
-      }
-    } catch (error) {
-      throw this.mapBunkHttpError(error, options.isTimedOut(), options.url, this.downloadTimeoutMs);
-    } finally {
-      await file.close().catch(() => undefined);
-      response.destroy();
-    }
-
-    const finalSize = await fsp.stat(options.outputPath).then((entry) => entry.size).catch(() => downloadedBytes);
-    options.onProgress?.({ status: 'finished', downloadedBytes: finalSize });
-    return finalSize;
+    return await streamDownloadToFile({
+      request: (headers) =>
+        this.bunkRawRequest(new URL(options.url), 'GET', headers, undefined, options.signal),
+      outputPath: options.outputPath,
+      signal: options.signal,
+      isTimedOut: options.isTimedOut,
+      onProgress: options.onProgress,
+      mapError: (error) =>
+        this.mapBunkHttpError(error, options.isTimedOut(), options.url, this.downloadTimeoutMs),
+    });
   }
 
   private mapBunkHttpError(error: unknown, timedOut: boolean, url: string, timeoutMs: number): Error {
@@ -1221,6 +1188,180 @@ function parseContentLength(value: string | null): number | undefined {
   }
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? number : undefined;
+}
+
+/**
+ * Low-level request callback for `streamDownloadToFile`. Given the request
+ * headers it must return the raw response (or reject with a transport error).
+ * Kept injectable so the resume logic can be exercised against a fake server.
+ */
+export type ResumeStreamRequest = (headers: Record<string, string>) => Promise<IncomingMessage>;
+
+export type ResumeStreamOptions = {
+  request: ResumeStreamRequest;
+  outputPath: string;
+  signal: AbortSignal;
+  isTimedOut: () => boolean;
+  onProgress?: (progress: VideoDownloadProgress) => void;
+  /** Wraps transport errors (timeouts, aborts) the way the caller needs. */
+  mapError: (error: unknown) => Error;
+};
+
+/**
+ * Stream a direct HTTP download to disk, resuming an existing partial file.
+ *
+ * Resume protocol: stat the partial (N bytes), send `Range: bytes=N-`:
+ *  - 206 + `content-range: bytes N-(T-1)/T`: append from N, progress counts
+ *    from N. A reported total smaller than the partial means the server file
+ *    changed/shrank and the partial cannot be trusted: restart from zero.
+ *  - 200: the server ignored the Range header: restart from zero.
+ *  - 416: the partial is at (or beyond) EOF. When the reported total equals N
+ *    the download was already complete; otherwise restart from zero.
+ * A restart truncates the file and re-requests without the Range header, so a
+ * retry against a *different URL for the same file* (expired signed URL) keeps
+ * the downloaded bytes whenever the server still serves the same content.
+ */
+export async function streamDownloadToFile(options: ResumeStreamOptions): Promise<number> {
+  const resumeFromBytes = await fsp
+    .stat(options.outputPath)
+    .then((entry) => entry.size)
+    .catch(() => 0);
+
+  let outcome = await streamRangeOnce({ ...options, resumeBytes: resumeFromBytes });
+  if (outcome.restart) {
+    outcome = await streamRangeOnce({ ...options, resumeBytes: 0 });
+  }
+  return outcome.size;
+}
+
+type RangeStreamOutcome = { size: number; restart?: boolean };
+
+async function streamRangeOnce(
+  options: ResumeStreamOptions & { resumeBytes: number },
+): Promise<RangeStreamOutcome> {
+  const headers: Record<string, string> = { ...BUNKR_BROWSER_HEADERS, accept: 'video/*' };
+  if (options.resumeBytes > 0) {
+    headers.range = `bytes=${options.resumeBytes}-`;
+  }
+
+  let response: IncomingMessage;
+  try {
+    response = await options.request(headers);
+  } catch (error) {
+    throw options.mapError(error);
+  }
+
+  const status = response.statusCode ?? 0;
+
+  if (status === 416 && options.resumeBytes > 0) {
+    response.destroy();
+    const total = parseContentRangeTotal(String(response.headers['content-range'] ?? ''));
+    // The partial already holds the whole file: nothing left to download.
+    if (total === options.resumeBytes) {
+      options.onProgress?.({ status: 'finished', downloadedBytes: total });
+      return { size: total };
+    }
+    return { size: 0, restart: true };
+  }
+
+  const rangeWasSent = options.resumeBytes > 0;
+
+  if (rangeWasSent && status === 206) {
+    const total = parseContentRangeTotal(String(response.headers['content-range'] ?? ''));
+    if (total !== undefined && total < options.resumeBytes) {
+      // The server file changed or shrank: the partial cannot be trusted.
+      response.destroy();
+      return { size: 0, restart: true };
+    }
+  } else if (rangeWasSent && status === 200) {
+    // The server ignored the Range request: start over from zero.
+    response.destroy();
+    return { size: 0, restart: true };
+  } else if (status < 200 || status >= 300) {
+    const sample = await readResponseBody(response).catch(() => '');
+    throw new Error(`Bunk unduh responde HTTP ${status}${sample ? `: ${sample.slice(0, 200)}` : ''}`);
+  }
+
+  const resumed = rangeWasSent && status === 206 ? options.resumeBytes : 0;
+  const contentLength = parseContentLength(String(response.headers['content-length'] ?? ''));
+  // On 206 the content-length counts only the remaining bytes, so the real
+  // total comes from `content-range` (falling back to resumed + remaining).
+  const totalBytes = resumed > 0
+    ? parseContentRangeTotal(String(response.headers['content-range'] ?? '')) ??
+      (contentLength !== undefined ? resumed + contentLength : undefined)
+    : contentLength;
+  const started = Date.now();
+  let newBytes = 0;
+  const file = await fsp.open(options.outputPath, resumed > 0 ? 'a' : 'w');
+
+  const emitProgress = () => {
+    if (options.onProgress === undefined) {
+      return;
+    }
+
+    const downloadedBytes = resumed + newBytes;
+    const elapsedSeconds = Math.max(1, (Date.now() - started) / 1000);
+    const hasTotal = totalBytes !== undefined && totalBytes > 0;
+    options.onProgress({
+      status: 'downloading',
+      downloadedBytes,
+      totalBytes,
+      speedBytesPerSecond: newBytes > 0 ? newBytes / elapsedSeconds : undefined,
+      percent: hasTotal ? (downloadedBytes / (totalBytes as number)) * 100 : undefined,
+    });
+  };
+
+  try {
+    for await (const chunk of response) {
+      await file.writeFile(chunk);
+      newBytes += chunk.length;
+      emitProgress();
+    }
+  } catch (error) {
+    throw options.mapError(error);
+  } finally {
+    await file.close().catch(() => undefined);
+    response.destroy();
+  }
+
+  const finalSize = await fsp
+    .stat(options.outputPath)
+    .then((entry) => entry.size)
+    .catch(() => resumed + newBytes);
+  options.onProgress?.({ status: 'finished', downloadedBytes: finalSize });
+  return { size: finalSize };
+}
+
+/** Parses a `content-range` header total, e.g. "bytes 100-999/1234". */
+function parseContentRangeTotal(value: string): number | undefined {
+  const match = value.trim().match(/^bytes\s+\S+\/(\d+)$/i);
+  if (!match) {
+    return undefined;
+  }
+  const number = Number(match[1]);
+  return Number.isFinite(number) && number > 0 ? number : undefined;
+}
+
+/**
+ * Removes leftover `bunk-video.*` partials of earlier attempts whose extension
+ * no longer matches (the server-side file name changed), keeping the file that
+ * the current attempt will write.
+ */
+async function removeStaleBunkPartials(outputDir: string, keepFileName: string): Promise<void> {
+  let entries: string[] = [];
+  try {
+    entries = await fsp.readdir(outputDir);
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    if (entry === keepFileName || !entry.startsWith('bunk-video')) {
+      continue;
+    }
+
+    await fsp.rm(path.join(outputDir, entry), { force: true }).catch(() => undefined);
+  }
 }
 
 async function readResponseBody(response: IncomingMessage, limit = BUNKR_ERROR_BODY_LIMIT): Promise<string> {

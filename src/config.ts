@@ -10,6 +10,8 @@ export type AppConfig = {
   dbPath: string;
   maxFileSizeBytes: number;
   downloadTimeoutMs: number;
+  downloadRetries: number;
+  downloadRetryBackoffMs: number;
   ytdlpProxy?: string;
   screenshotCount: number;
   sendVideoInAlbum: boolean;
@@ -43,6 +45,10 @@ export function loadConfig(): AppConfig {
     dbPath: process.env.DB_PATH ?? path.join(process.env.DOWNLOAD_DIR ?? '/tmp/telegram-video-bot', 'bot.db'),
     maxFileSizeBytes: Number(process.env.MAX_FILE_SIZE_BYTES ?? 2147483648),
     downloadTimeoutMs: Number(process.env.DOWNLOAD_TIMEOUT_MS ?? 900000),
+    // Automatic download attempts per link. Retries resume the leftover
+    // partial file instead of starting over (see process-message.ts).
+    downloadRetries: Number(process.env.DOWNLOAD_RETRIES ?? 10),
+    downloadRetryBackoffMs: Number(process.env.DOWNLOAD_RETRY_BACKOFF_MS ?? 2000),
     ytdlpProxy: process.env.YTDLP_PROXY || undefined,
     screenshotCount: Number(process.env.SCREENSHOT_COUNT ?? 5),
     sendVideoInAlbum: process.env.SEND_VIDEO_IN_ALBUM !== 'false',

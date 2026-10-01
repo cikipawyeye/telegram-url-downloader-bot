@@ -2,7 +2,7 @@ import type { WorkspaceManager } from '../storage/workspace.js';
 import type { BotDatabase } from '../storage/database.js';
 import type { StatusMessage } from '../telegram/notifier.js';
 import type { TelegramNotifier } from '../telegram/notifier.js';
-import { buildDeliveryFileName, buildDeliveryPartFileName, buildPartCaption, buildFailureSummary, formatBytes, formatDownloadProgress, hasNoProxyOverride, parseVideoRequestItems, summarizeErrorMessage, truncateCaption, type BatchFailure, type VideoDownloadProgress, type VideoRequestItem, type VideoThumbnail } from './utils.js';
+import { buildDeliveryFileName, buildDeliveryPartFileName, buildPartCaption, buildFailureSummary, formatBytes, formatDownloadProgress, downloadIdentity, hasNoProxyOverride, parseVideoRequestItems, summarizeErrorMessage, truncateCaption, type BatchFailure, type VideoDownloadProgress, type VideoRequestItem, type VideoThumbnail } from './utils.js';
 import type { VideoDownloader } from './downloader.js';
 import { DownloadCancelledError } from './downloader.js';
 import { buildPixelAspectFilter } from './screenshots.js';
@@ -40,6 +40,8 @@ export class VideoMessageProcessor {
   private readonly screenshotCount: number;
   private readonly sendVideoInAlbum: boolean;
   private readonly reencodeAnamorphic: boolean;
+  private readonly downloadRetries: number;
+  private readonly downloadRetryBackoffMs: number;
   private readonly pendingCancellations = new Map<number, AbortController>();
 
   constructor(options: {
@@ -52,6 +54,10 @@ export class VideoMessageProcessor {
     screenshotCount: number;
     sendVideoInAlbum: boolean;
     reencodeAnamorphic: boolean;
+    /** Automatic download attempts per link; each retry resumes the partial. */
+    downloadRetries?: number;
+    /** Base delay between attempts, multiplied by the attempt number. */
+    downloadRetryBackoffMs?: number;
     db?: BotDatabase;
   }) {
     this.maxFileSizeBytes = options.maxFileSizeBytes;
@@ -63,6 +69,8 @@ export class VideoMessageProcessor {
     this.screenshotCount = options.screenshotCount;
     this.sendVideoInAlbum = options.sendVideoInAlbum;
     this.reencodeAnamorphic = options.reencodeAnamorphic;
+    this.downloadRetries = options.downloadRetries ?? 10;
+    this.downloadRetryBackoffMs = options.downloadRetryBackoffMs ?? 2000;
     this.db = options.db;
   }
 
@@ -219,35 +227,88 @@ export class VideoMessageProcessor {
         return;
       }
 
-      const workspace = await this.workspaceManager.create(userId);
+      // A previous failed/cancelled attempt of the same file may have left a
+      // workspace holding a partial download. Claim and reuse it, so a resend
+      // of the (possibly re-signed/expired) link continues the old download.
+      const resumable = jobId !== undefined
+        ? this.db?.takeResumableItem(
+            notifier.chatId,
+            (url) => downloadIdentity(url) === downloadIdentity(item.url),
+          )
+        : undefined;
+      const workspace = await this.workspaceManager.create(userId, { reuseDir: resumable?.resumeDir });
+      const reusedPartial = resumable !== undefined && workspace.dirPath === resumable.resumeDir;
+
       const noProxyLabel = item.noProxy ? ' tanpa proxy' : '';
+      const resumeLabel = reusedPartial ? ', melanjutkan download sebelumnya' : '';
       await notifier.updateStatus(
         acceptedMessage,
-        `Selesai ${completed}/${items.length}. Memproses ${index + 1}/${items.length}${noProxyLabel}...`,
+        `Selesai ${completed}/${items.length}. Memproses ${index + 1}/${items.length}${noProxyLabel}${resumeLabel}...`,
       );
 
       let itemId: number | undefined;
       if (jobId !== undefined) {
         itemId = this.db?.addItem(jobId, item.url, { noProxy: item.noProxy });
+        if (itemId !== undefined) {
+          this.db?.setItemResumeDir(itemId, workspace.dirPath);
+        }
       }
 
+      let succeeded = false;
       try {
-        const video = await this.videoDownloader.download({
-          url: item.url,
-          outputDir: workspace.dirPath,
-          signal,
-          noProxy: item.noProxy,
-          onProgress: (progress) => {
-            void this.reportDownloadProgress(notifier, acceptedMessage, progress);
-          },
-        });
+        const maxAttempts = Math.max(1, this.downloadRetries);
+        let video: Awaited<ReturnType<VideoDownloader['download']>> | undefined;
+        let lastError: unknown;
+
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          if (signal.aborted) {
+            throw new DownloadCancelledError();
+          }
+
+          try {
+            video = await this.videoDownloader.download({
+              url: item.url,
+              outputDir: workspace.dirPath,
+              signal,
+              noProxy: item.noProxy,
+              onProgress: (progress) => {
+                void this.reportDownloadProgress(notifier, acceptedMessage, progress);
+              },
+            });
+            break;
+          } catch (error) {
+            if (error instanceof DownloadCancelledError) {
+              throw error;
+            }
+
+            lastError = error;
+            console.error(`Download attempt ${attempt}/${maxAttempts} failed for ${item.url}:`, error);
+
+            if (attempt < maxAttempts) {
+              const backoffMs = Math.min(30_000, this.downloadRetryBackoffMs * attempt);
+              await notifier.updateStatus(
+                acceptedMessage,
+                `Attempt ${attempt}/${maxAttempts} gagal: ${summarizeErrorMessage(error)}\nMelanjutkan dari posisi terakhir dalam ${Math.round(backoffMs / 1000)} detik...`,
+              );
+              await this.delay(backoffMs, signal);
+            }
+          }
+        }
+
+        if (video === undefined) {
+          throw lastError instanceof Error ? lastError : new Error(String(lastError));
+        }
+
         await this.processDownloadedVideo(notifier, acceptedMessage, workspace.dirPath, video, convertToHeight, signal);
         completed += 1;
+        succeeded = true;
         if (itemId !== undefined) {
           this.db?.completeItem(itemId, video);
+          this.db?.clearItemResume(itemId);
         }
       } catch (error) {
         if (error instanceof DownloadCancelledError) {
+          // Keep the workspace: a resend of this link resumes the partial.
           if (jobId !== undefined) {
             this.db?.cancelItems(jobId);
             this.db?.finishJob(jobId, 'cancelled');
@@ -264,10 +325,15 @@ export class VideoMessageProcessor {
         const hasNextLink = index + 1 < items.length;
         await notifier.updateStatus(
           acceptedMessage,
-          `Link ${index + 1}/${items.length} gagal: ${reason}${hasNextLink ? '\nLanjut ke link berikutnya...' : ''}`,
+          `Link ${index + 1}/${items.length} gagal: ${reason}\nKirim ulang link ini untuk melanjutkan dari posisi terakhir.${hasNextLink ? '\nLanjut ke link berikutnya...' : ''}`,
         );
       } finally {
-        await this.workspaceManager.remove(workspace);
+        // On success the workspace is dead weight. On failure/cancel it keeps
+        // the partial download for a resume attempt; the orphan sweep removes
+        // it if the user never comes back.
+        if (succeeded) {
+          await this.workspaceManager.remove(workspace);
+        }
       }
     }
 
@@ -281,6 +347,28 @@ export class VideoMessageProcessor {
         : `Bulk selesai: ${completed}/${items.length} berhasil, ${failed.length} gagal.`;
       await notifier.updateStatus(acceptedMessage, buildFailureSummary(header, failed));
     }
+  }
+
+  /** Abortable sleep used between download retry attempts. */
+  private async delay(ms: number, signal?: AbortSignal): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(new DownloadCancelledError());
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+
+      if (signal) {
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
   }
 
   private async processDownloadedVideo(
