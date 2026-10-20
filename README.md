@@ -4,7 +4,7 @@ Bot ini menerima URL dari user, mencoba mengunduh videonya dengan `yt-dlp`, lalu
 
 ## Fitur
 - menerima link dari user via Telegram
-- bulk download hingga 10 URL dalam satu pesan (diproses berurutan)
+- bulk download hingga 20 URL dalam satu pesan; unduhan link berikutnya sudah jalan (prefetch) selagi link sebelumnya dikonversi/dikirim, sedangkan pengiriman ke Telegram tetap berurutan
 - webhook-ready untuk deployment
 - download dengan `yt-dlp`
 - perintah `/audio`: balas (reply) pesan video dari bot untuk mengekstrak audionya lalu mengirimnya kembali sebagai MP3
@@ -29,9 +29,9 @@ src/
   audio/                    # ekstraksi audio dari video (ffmpeg) dan alur /audio
   config.ts                 # load environment config
   http/                     # Express app dan endpoint health check
-  storage/                  # workspace temp file
+  storage/                  # workspace temp file + disk admission guard
   telegram/                 # handler, notifier, dan pengambil file dari Telegram
-  video/                    # download, screenshot, util, dan flow utama
+  video/                    # download, prefetch/limit unduhan, screenshot, util, dan flow utama
 ```
 
 Alur request tetap sama:
@@ -50,6 +50,20 @@ Secara default bot mengirim screenshot beserta video dalam **satu album/media gr
 - Batas media group adalah **maksimal 10 item** dan **hanya caption item pertama** yang ditampilkan.
 - Kalau video terpecah jadi beberapa part, atau jumlah item melebihi 10, bot otomatis fallback ke pengiriman terpisah (screenshot sendiri, video sendiri).
 - Untuk tetap mengirim video full-quality streamable, set `SEND_VIDEO_IN_ALBUM=false`.
+
+### Prefetch unduhan (video besar)
+Antrean FIFO per chat sekarang hanya mengatur **pengiriman**, bukan unduhan:
+
+1. Saat link diterima, bot langsung mengunduh (prefetch) tanpa menunggu giliran kirim.
+2. Link yang sedang diunduh tetapi belum giliran tetap menampilkan progress di pesan statusnya.
+3. Pengiriman (konversi, screenshot, split, upload) tetap berurutan sesuai urutan link, jadi urutan media di Telegram tidak berubah.
+
+Batasnya:
+- `DOWNLOAD_CONCURRENCY` (default `1`) — jumlah unduhan bersamaan untuk **seluruh** chat. Nilai `1` sudah membuat unduhan link berikutnya jalan selagi link sekarang dikirim.
+- `MIN_FREE_DISK_BYTES` (default 6 GiB) dan `DOWNLOAD_RESERVE_BYTES` (default 4 GiB) — sebelum unduhan dimulai, bot memastikan sisa disk masih cukup. Untuk video 4 GB+ yang dipecah menjadi part, satu job butuh ruang untuk file asli **dan** hasil split (sekitar 2x ukuran file), jadi naikkan `MIN_FREE_DISK_BYTES` bila ukuran file biasanya 4 GB atau lebih (mis. `12884901888` = 12 GiB).
+- Kalau ruang tidak cukup, link tersebut gagal dengan alasan yang jelas (bukan error ffmpeg/ENOSPC), dan pesan menyebutkan berapa GB yang tersedia/dibutuhkan.
+- Kalau ruang sedang penuh karena file yang baru dikirim belum dihapus, bot menunggu sekitar 15 detik (sampai 4 kali percobaan) sebelum menyatakan link gagal, sehingga batch video besar di disk ketat tidak langsung putus. Tombol Stop tetap bisa menghentikan penantian ini.
+- Saat pengguna menekan Stop: unduhan yang sudah selesai tetapi belum terkirim dihapus, sedangkan unduhan yang masih berjalan dibiarkan sebagai file parsial supaya bisa dilanjutkan saat link dikirim ulang.
 
 ## Penting
 Agar bot bisa mengirim file besar, sebaiknya gunakan **local/self-hosted Telegram Bot API** dan isi `TELEGRAM_API_ROOT`.

@@ -7,10 +7,12 @@ import { AudioMessageProcessor } from './audio/process-audio-reply.js';
 import { loadConfig } from './config.js';
 import { createHttpApp } from './http/create-app.js';
 import { BotDatabase } from './storage/database.js';
+import { DiskSpaceGuard } from './storage/disk-space.js';
 import { WorkspaceManager } from './storage/workspace.js';
 import { registerBotHandlers, BOT_COMMANDS } from './telegram/register-handlers.js';
 import { TelegramMediaDownloader } from './telegram/telegram-media.js';
 import { VideoDownloader } from './video/downloader.js';
+import { DownloadSlots } from './video/download-slots.js';
 import { VideoConverter } from './video/converter.js';
 import { VideoMessageProcessor } from './video/process-message.js';
 import { VideoScreenshotGenerator } from './video/screenshots.js';
@@ -42,6 +44,16 @@ async function bootstrap(): Promise<void> {
 
   const db = new BotDatabase(config.dbPath);
 
+  // Shared across every chat: queued batches prefetch their links while another
+  // chat (or an earlier message) is still sending, so the limit has to be
+  // process-wide to keep the number of concurrent 4 GB+ downloads predictable.
+  const downloadSlots = new DownloadSlots(config.downloadConcurrency);
+  const diskGuard = new DiskSpaceGuard({
+    dir: config.downloadDir,
+    minFreeBytes: config.minFreeDiskBytes,
+    reserveBytes: config.downloadReserveBytes,
+  });
+
   const videoMessageProcessor = new VideoMessageProcessor({
     maxFileSizeBytes: config.maxFileSizeBytes,
     videoDownloader: new VideoDownloader({
@@ -64,6 +76,8 @@ async function bootstrap(): Promise<void> {
     reencodeAnamorphic: config.reencodeAnamorphic,
     downloadRetries: config.downloadRetries,
     downloadRetryBackoffMs: config.downloadRetryBackoffMs,
+    downloadSlots,
+    diskGuard,
     db,
   });
 

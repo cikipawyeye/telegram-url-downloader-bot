@@ -12,6 +12,12 @@ export type AppConfig = {
   downloadTimeoutMs: number;
   downloadRetries: number;
   downloadRetryBackoffMs: number;
+  /** How many links may download at the same time, process-wide. */
+  downloadConcurrency: number;
+  /** Free space that must stay untouched after active reservations. */
+  minFreeDiskBytes: number;
+  /** Peak size assumed per running download (a 4 GB+ file plus its split copy). */
+  downloadReserveBytes: number;
   ytdlpProxy?: string;
   screenshotCount: number;
   sendVideoInAlbum: boolean;
@@ -49,9 +55,28 @@ export function loadConfig(): AppConfig {
     // partial file instead of starting over (see process-message.ts).
     downloadRetries: Number(process.env.DOWNLOAD_RETRIES ?? 10),
     downloadRetryBackoffMs: Number(process.env.DOWNLOAD_RETRY_BACKOFF_MS ?? 2000),
+    // Links are prefetched while earlier links are still being converted and
+    // sent, so 1 already overlaps download with delivery. Raise it only when
+    // the disk can hold several large files at once: each slot may add a 4 GB+
+    // download on top of the file currently being sent.
+    downloadConcurrency: readNonNegativeNumber(process.env.DOWNLOAD_CONCURRENCY, 1),
+    // Keep this above the largest expected peak of one job: a 4 GB video split
+    // into parts needs the download plus its parts (about 2x the file size).
+    minFreeDiskBytes: readNonNegativeNumber(process.env.MIN_FREE_DISK_BYTES, 6442450944),
+    downloadReserveBytes: readNonNegativeNumber(process.env.DOWNLOAD_RESERVE_BYTES, 4294967296),
     ytdlpProxy: process.env.YTDLP_PROXY || undefined,
     screenshotCount: Number(process.env.SCREENSHOT_COUNT ?? 5),
     sendVideoInAlbum: process.env.SEND_VIDEO_IN_ALBUM !== 'false',
     reencodeAnamorphic: process.env.REENCODE_ANAMORPHIC !== 'false',
   };
+}
+
+/** Env numbers are optional; a missing or malformed value keeps the default. */
+function readNonNegativeNumber(value: string | undefined, fallback: number): number {
+  if (value === undefined || value.trim() === '') {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }

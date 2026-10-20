@@ -1,10 +1,14 @@
-import type { WorkspaceManager } from '../storage/workspace.js';
+import type { DownloadWorkspace, WorkspaceManager } from '../storage/workspace.js';
 import type { BotDatabase } from '../storage/database.js';
+import type { DiskSpaceGuard } from '../storage/disk-space.js';
+import { InsufficientDiskSpaceError } from '../storage/disk-space.js';
 import type { StatusMessage } from '../telegram/notifier.js';
 import type { TelegramNotifier } from '../telegram/notifier.js';
-import { buildDeliveryFileName, buildDeliveryPartFileName, buildPartCaption, buildFailureSummary, formatBytes, formatDownloadProgress, downloadIdentity, hasNoProxyOverride, parseVideoRequestItems, summarizeErrorMessage, truncateCaption, type BatchFailure, type VideoDownloadProgress, type VideoRequestItem, type VideoThumbnail } from './utils.js';
+import { buildDeliveryFileName, buildDeliveryPartFileName, buildPartCaption, buildFailureSummary, formatBytes, downloadIdentity, hasNoProxyOverride, parseVideoRequestItems, summarizeErrorMessage, truncateCaption, type BatchFailure, type DownloadedVideo, type VideoRequestItem, type VideoThumbnail } from './utils.js';
 import type { VideoDownloader } from './downloader.js';
 import { DownloadCancelledError } from './downloader.js';
+import { BatchProgressReporter } from './batch-progress.js';
+import { DownloadSlots } from './download-slots.js';
 import { buildPixelAspectFilter } from './screenshots.js';
 import type { VideoScreenshotGenerator } from './screenshots.js';
 import type { VideoSplitter } from './splitter.js';
@@ -26,6 +30,45 @@ type BatchOptions = {
   jobId?: number;
 };
 
+/**
+ * One link of a batch: its download starts as soon as the batch is accepted
+ * (even while the batch is still waiting for its FIFO delivery turn), and the
+ * delivery loop consumes the slot in input order.
+ */
+type PrefetchSlot = {
+  index: number;
+  item: VideoRequestItem;
+  /**
+   * Leftover partial download claimed for this link before the batch starts.
+   * Claimed early so a concurrent batch cannot steal it while this one waits.
+   */
+  resumable?: { itemId: number; resumeDir: string };
+  /** Only `pending` slots are cleaned up when a batch ends early. */
+  state: 'pending' | 'delivered' | 'failed' | 'cancelled' | 'discarded';
+  /** True once the download task finished (succeeded, failed or aborted). */
+  settled: boolean;
+  workspace?: DownloadWorkspace;
+  itemId?: number;
+  video?: DownloadedVideo;
+  error?: unknown;
+  /** Never rejects: the outcome is stored on the slot. */
+  task: Promise<void>;
+};
+
+type BatchPrefetch = {
+  /** Album expansion result; the per-link downloads are already started. */
+  ready: Promise<{ items: VideoRequestItem[]; expansionFailures: BatchFailure[] }>;
+  reporter: BatchProgressReporter;
+  slots: PrefetchSlot[];
+  /**
+   * Remove the workspaces of downloads that finished but will never be
+   * delivered (batch stopped or failed). Downloads that are still running are
+   * left alone: their partial file is what a resend resumes from.
+   */
+  discardUndelivered: () => Promise<void>;
+};
+
+
 export class VideoMessageProcessor {
   /** FIFO per chat; serializes whole concurrent batches so cross-batch media order is stable. */
   private static readonly batchQueues = new Map<number, Promise<void>>();
@@ -42,6 +85,10 @@ export class VideoMessageProcessor {
   private readonly reencodeAnamorphic: boolean;
   private readonly downloadRetries: number;
   private readonly downloadRetryBackoffMs: number;
+  private readonly downloadSlots: DownloadSlots;
+  private readonly diskGuard?: DiskSpaceGuard;
+  private readonly diskWaitAttempts: number;
+  private readonly diskWaitIntervalMs: number;
   private readonly pendingCancellations = new Map<number, AbortController>();
 
   constructor(options: {
@@ -58,6 +105,14 @@ export class VideoMessageProcessor {
     downloadRetries?: number;
     /** Base delay between attempts, multiplied by the attempt number. */
     downloadRetryBackoffMs?: number;
+    /** Process-wide download limiter; share one instance across chats. */
+    downloadSlots?: DownloadSlots;
+    /** Disk admission control for large downloads; omitted in lightweight tests. */
+    diskGuard?: DiskSpaceGuard;
+    /** How many times a download waits for free disk before failing (default 4). */
+    diskWaitAttempts?: number;
+    /** Delay between those disk-space checks (default 15s). */
+    diskWaitIntervalMs?: number;
     db?: BotDatabase;
   }) {
     this.maxFileSizeBytes = options.maxFileSizeBytes;
@@ -71,6 +126,10 @@ export class VideoMessageProcessor {
     this.reencodeAnamorphic = options.reencodeAnamorphic;
     this.downloadRetries = options.downloadRetries ?? 10;
     this.downloadRetryBackoffMs = options.downloadRetryBackoffMs ?? 2000;
+    this.downloadSlots = options.downloadSlots ?? new DownloadSlots(1);
+    this.diskGuard = options.diskGuard;
+    this.diskWaitAttempts = Math.max(1, options.diskWaitAttempts ?? 4);
+    this.diskWaitIntervalMs = Math.max(0, options.diskWaitIntervalMs ?? 15_000);
     this.db = options.db;
   }
 
@@ -125,15 +184,25 @@ export class VideoMessageProcessor {
         `stop:download:${acceptedMessage.messageId}`,
       );
 
-      // Catch here: a rejecting batch must never become an unhandled
-      // rejection (it crashes the process and kills the stop button).
-      this.enqueueBatch(
+      // Downloads start here, before the batch gets its FIFO delivery turn:
+      // the queue below only serializes conversion/screenshots/sending, so a
+      // large link is already on disk when the previous link finishes sending.
+      const prefetch = this.startPrefetch({
         notifier,
         acceptedMessage,
         items,
         userId,
-        { convertToHeight, forceNoProxy, signal: controller.signal, jobId },
-      ).catch(async (error) => {
+        batch: { convertToHeight, forceNoProxy, signal: controller.signal, jobId },
+      });
+
+      // Catch here: a rejecting batch must never become an unhandled
+      // rejection (it crashes the process and kills the stop button).
+      this.enqueueBatch(notifier, acceptedMessage, prefetch, {
+        convertToHeight,
+        forceNoProxy,
+        signal: controller.signal,
+        jobId,
+      }).catch(async (error) => {
         console.error(`Batch failed for status message ${acceptedMessage.messageId}:`, error);
 
         this.pendingCancellations.delete(acceptedMessage.messageId);
@@ -141,6 +210,8 @@ export class VideoMessageProcessor {
           this.db?.cancelItems(jobId);
           this.db?.finishJob(jobId, 'failed');
         }
+
+        await prefetch.discardUndelivered().catch(() => undefined);
 
         const reason = summarizeErrorMessage(error);
         await notifier.updateStatus(
@@ -156,15 +227,14 @@ export class VideoMessageProcessor {
   private enqueueBatch(
     notifier: TelegramNotifier,
     acceptedMessage: StatusMessage,
-    items: VideoRequestItem[],
-    userId: string,
+    prefetch: BatchPrefetch,
     batch: BatchOptions,
   ): Promise<void> {
     const chatId = notifier.chatId;
     const previous = VideoMessageProcessor.batchQueues.get(chatId) ?? Promise.resolve();
     const current = previous
       .catch(() => undefined)
-      .then(() => this.processBatch(notifier, acceptedMessage, items, userId, batch));
+      .then(() => this.processBatch(notifier, acceptedMessage, prefetch, batch));
     // Reflect the final settled state in the map regardless of failure, so the
     // next batch for this chat is never blocked by a rejected queue entry.
     const queueEntry = current.then(
@@ -179,25 +249,11 @@ export class VideoMessageProcessor {
   private async processBatch(
     notifier: TelegramNotifier,
     acceptedMessage: StatusMessage,
-    items: VideoRequestItem[],
-    userId: string,
-    { convertToHeight, forceNoProxy, signal, jobId }: BatchOptions,
+    prefetch: BatchPrefetch,
+    { convertToHeight, signal, jobId }: BatchOptions,
   ): Promise<void> {
-    const expandedItems: VideoRequestItem[] = [];
-    const expansionFailures: BatchFailure[] = [];
-    for (const item of items) {
-      try {
-        const expandedUrls = await this.videoDownloader.expandUrl(item.url);
-        expandedItems.push(
-          ...expandedUrls.map((url) => ({ url, noProxy: item.noProxy || forceNoProxy })),
-        );
-      } catch (error) {
-        console.error(`Failed to read bulk URL ${item.url}:`, error);
-        expansionFailures.push({ url: item.url, reason: summarizeErrorMessage(error) });
-      }
-    }
+    const { items, expansionFailures } = await prefetch.ready;
 
-    items = expandedItems;
     if (items.length === 0) {
       this.pendingCancellations.delete(acceptedMessage.messageId);
       if (jobId !== undefined) {
@@ -217,98 +273,38 @@ export class VideoMessageProcessor {
       this.db?.setJobTotalUrls(jobId, items.length);
     }
 
-    const failed: BatchFailure[] = [];
+    const failed: BatchFailure[] = expansionFailures.slice();
+    // Links that failed to expand never became items, so the summary counts the
+    // requested links (expanded + failed) to stay consistent with the reasons.
+    const totalRequested = items.length + expansionFailures.length;
     let completed = 0;
 
-    for (const [index, item] of items.entries()) {
+    for (const [index, slot] of prefetch.slots.entries()) {
       if (signal.aborted) {
+        // Keep this link's partial download for a resend, drop the prefetched
+        // ones that will never be delivered.
+        slot.state = 'cancelled';
+        await prefetch.discardUndelivered();
         await notifier.confirmStopped(acceptedMessage);
         this.pendingCancellations.delete(acceptedMessage.messageId);
         return;
       }
 
-      // A previous failed/cancelled attempt of the same file may have left a
-      // workspace holding a partial download. Claim and reuse it, so a resend
-      // of the (possibly re-signed/expired) link continues the old download.
-      const resumable = jobId !== undefined
-        ? this.db?.takeResumableItem(
-            notifier.chatId,
-            (url) => downloadIdentity(url) === downloadIdentity(item.url),
-          )
-        : undefined;
-      const workspace = await this.workspaceManager.create(userId, { reuseDir: resumable?.resumeDir });
-      const reusedPartial = resumable !== undefined && workspace.dirPath === resumable.resumeDir;
+      prefetch.reporter.watch(index);
 
-      const noProxyLabel = item.noProxy ? ' tanpa proxy' : '';
-      const resumeLabel = reusedPartial ? ', melanjutkan download sebelumnya' : '';
+      const noProxyLabel = slot.item.noProxy ? ' tanpa proxy' : '';
+      const resumeLabel = slot.resumable !== undefined ? ', melanjutkan download sebelumnya' : '';
       await notifier.updateStatus(
         acceptedMessage,
         `Selesai ${completed}/${items.length}. Memproses ${index + 1}/${items.length}${noProxyLabel}${resumeLabel}...`,
       );
 
-      let itemId: number | undefined;
-      if (jobId !== undefined) {
-        itemId = this.db?.addItem(jobId, item.url, { noProxy: item.noProxy });
-        if (itemId !== undefined) {
-          this.db?.setItemResumeDir(itemId, workspace.dirPath);
-        }
-      }
+      await slot.task;
 
-      let succeeded = false;
-      try {
-        const maxAttempts = Math.max(1, this.downloadRetries);
-        let video: Awaited<ReturnType<VideoDownloader['download']>> | undefined;
-        let lastError: unknown;
-
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-          if (signal.aborted) {
-            throw new DownloadCancelledError();
-          }
-
-          try {
-            video = await this.videoDownloader.download({
-              url: item.url,
-              outputDir: workspace.dirPath,
-              signal,
-              noProxy: item.noProxy,
-              onProgress: (progress) => {
-                void this.reportDownloadProgress(notifier, acceptedMessage, progress);
-              },
-            });
-            break;
-          } catch (error) {
-            if (error instanceof DownloadCancelledError) {
-              throw error;
-            }
-
-            lastError = error;
-            console.error(`Download attempt ${attempt}/${maxAttempts} failed for ${item.url}:`, error);
-
-            if (attempt < maxAttempts) {
-              const backoffMs = Math.min(30_000, this.downloadRetryBackoffMs * attempt);
-              await notifier.updateStatus(
-                acceptedMessage,
-                `Attempt ${attempt}/${maxAttempts} gagal: ${summarizeErrorMessage(error)}\nMelanjutkan dari posisi terakhir dalam ${Math.round(backoffMs / 1000)} detik...`,
-              );
-              await this.delay(backoffMs, signal);
-            }
-          }
-        }
-
-        if (video === undefined) {
-          throw lastError instanceof Error ? lastError : new Error(String(lastError));
-        }
-
-        await this.processDownloadedVideo(notifier, acceptedMessage, workspace.dirPath, video, convertToHeight, signal);
-        completed += 1;
-        succeeded = true;
-        if (itemId !== undefined) {
-          this.db?.completeItem(itemId, video);
-          this.db?.clearItemResume(itemId);
-        }
-      } catch (error) {
-        if (error instanceof DownloadCancelledError) {
-          // Keep the workspace: a resend of this link resumes the partial.
+      if (slot.error !== undefined) {
+        if (slot.error instanceof DownloadCancelledError) {
+          slot.state = 'cancelled';
+          await prefetch.discardUndelivered();
           if (jobId !== undefined) {
             this.db?.cancelItems(jobId);
             this.db?.finishJob(jobId, 'cancelled');
@@ -316,22 +312,69 @@ export class VideoMessageProcessor {
           await notifier.confirmStopped(acceptedMessage);
           return;
         }
-        const reason = summarizeErrorMessage(error);
-        failed.push({ url: item.url, reason });
-        console.error(`Failed to process bulk URL ${item.url}:`, error);
-        if (itemId !== undefined) {
-          this.db?.failItem(itemId, reason);
+
+        const reason = summarizeErrorMessage(slot.error);
+        failed.push({ url: slot.item.url, reason });
+        slot.state = 'failed';
+        console.error(`Failed to process bulk URL ${slot.item.url}:`, slot.error);
+        if (slot.itemId !== undefined) {
+          this.db?.failItem(slot.itemId, reason);
         }
         const hasNextLink = index + 1 < items.length;
         await notifier.updateStatus(
           acceptedMessage,
           `Link ${index + 1}/${items.length} gagal: ${reason}\nKirim ulang link ini untuk melanjutkan dari posisi terakhir.${hasNextLink ? '\nLanjut ke link berikutnya...' : ''}`,
         );
+        continue;
+      }
+
+      const video = slot.video;
+      const workspace = slot.workspace;
+
+      if (video === undefined || workspace === undefined) {
+        const reason = 'Unduhan selesai tanpa menghasilkan file video.';
+        failed.push({ url: slot.item.url, reason });
+        slot.state = 'failed';
+        await notifier.updateStatus(acceptedMessage, `Link ${index + 1}/${items.length} gagal: ${reason}`);
+        continue;
+      }
+
+      try {
+        await this.processDownloadedVideo(notifier, acceptedMessage, workspace.dirPath, video, convertToHeight, signal);
+        completed += 1;
+        slot.state = 'delivered';
+        if (slot.itemId !== undefined) {
+          this.db?.completeItem(slot.itemId, video);
+          this.db?.clearItemResume(slot.itemId);
+        }
+      } catch (error) {
+        if (error instanceof DownloadCancelledError) {
+          slot.state = 'cancelled';
+          await prefetch.discardUndelivered();
+          if (jobId !== undefined) {
+            this.db?.cancelItems(jobId);
+            this.db?.finishJob(jobId, 'cancelled');
+          }
+          await notifier.confirmStopped(acceptedMessage);
+          return;
+        }
+
+        const reason = summarizeErrorMessage(error);
+        failed.push({ url: slot.item.url, reason });
+        slot.state = 'failed';
+        console.error(`Failed to process bulk URL ${slot.item.url}:`, error);
+        if (slot.itemId !== undefined) {
+          this.db?.failItem(slot.itemId, reason);
+        }
+        await notifier.updateStatus(
+          acceptedMessage,
+          `Link ${index + 1}/${items.length} gagal: ${reason}\nKirim ulang link ini untuk melanjutkan dari posisi terakhir.`,
+        );
       } finally {
         // On success the workspace is dead weight. On failure/cancel it keeps
-        // the partial download for a resume attempt; the orphan sweep removes
+        // the downloaded file for a resume attempt; the orphan sweep removes
         // it if the user never comes back.
-        if (succeeded) {
+        if (slot.state === 'delivered') {
           await this.workspaceManager.remove(workspace);
         }
       }
@@ -342,11 +385,253 @@ export class VideoMessageProcessor {
     if (failed.length === 0) {
       await notifier.deleteStatus(acceptedMessage);
     } else {
-      const header = items.length <= 1
+      const header = totalRequested <= 1
         ? 'Gagal memproses link:'
-        : `Bulk selesai: ${completed}/${items.length} berhasil, ${failed.length} gagal.`;
+        : `Bulk selesai: ${completed}/${totalRequested} berhasil, ${failed.length} gagal.`;
       await notifier.updateStatus(acceptedMessage, buildFailureSummary(header, failed));
     }
+  }
+
+  /**
+   * Expand album links and start one download task per resulting video.
+   *
+   * Called from `process()`, so prefetching is independent from the per-chat
+   * FIFO delivery queue: a message that is still waiting for its turn is
+   * already downloading. The shared `DownloadSlots` limiter and the
+   * `DiskSpaceGuard` bound how many large files can be in flight at once.
+   */
+  private startPrefetch(options: {
+    notifier: TelegramNotifier;
+    acceptedMessage: StatusMessage;
+    items: VideoRequestItem[];
+    userId: string;
+    batch: BatchOptions;
+  }): BatchPrefetch {
+    const { notifier, acceptedMessage, items, userId, batch } = options;
+    const reporter = new BatchProgressReporter({ notifier, statusMessage: acceptedMessage });
+    const slots: PrefetchSlot[] = [];
+
+    const ready = this.expandItems(items, batch.forceNoProxy).then(({ items: expanded, failures }) => {
+      for (const [index, item] of expanded.entries()) {
+        // Claim any leftover partial synchronously, before the slot waits for a
+        // download slot: the delivery loop needs to know about the resume while
+        // it still can put it in the "Memproses ..." status text.
+        const resumable = batch.jobId !== undefined
+          ? this.db?.takeResumableItem(
+              notifier.chatId,
+              (url) => downloadIdentity(url) === downloadIdentity(item.url),
+            )
+          : undefined;
+
+        const slot: PrefetchSlot = {
+          index,
+          item,
+          resumable,
+          state: 'pending',
+          settled: false,
+          task: Promise.resolve(),
+        };
+
+        slot.task = this.prefetchItem({
+          slot,
+          userId,
+          total: expanded.length,
+          batch,
+          reporter,
+        });
+        slots.push(slot);
+      }
+
+      return { items: expanded, expansionFailures: failures };
+    });
+
+    const discardUndelivered = async (): Promise<void> => {
+      const pending = slots.filter((slot) => slot.state === 'pending');
+
+      for (const slot of pending) {
+        slot.state = 'discarded';
+      }
+
+      for (const slot of pending) {
+        await slot.task;
+
+        // Only finished downloads are removed: a partial download that is
+        // still being aborted stays on disk so a resend can resume it.
+        if (!slot.settled || slot.workspace === undefined) {
+          continue;
+        }
+
+        await this.workspaceManager.remove(slot.workspace);
+
+        if (slot.itemId !== undefined) {
+          this.db?.clearItemResume(slot.itemId);
+        }
+      }
+    };
+
+    return { ready, reporter, slots, discardUndelivered };
+  }
+
+  /** Read the URLs behind the links; album links expand into several videos. */
+  private async expandItems(
+    items: VideoRequestItem[],
+    forceNoProxy: boolean,
+  ): Promise<{ items: VideoRequestItem[]; failures: BatchFailure[] }> {
+    const expandedItems: VideoRequestItem[] = [];
+    const expansionFailures: BatchFailure[] = [];
+
+    for (const item of items) {
+      try {
+        const expandedUrls = await this.videoDownloader.expandUrl(item.url);
+        expandedItems.push(
+          ...expandedUrls.map((url) => ({ url, noProxy: item.noProxy || forceNoProxy })),
+        );
+      } catch (error) {
+        console.error(`Failed to read bulk URL ${item.url}:`, error);
+        expansionFailures.push({ url: item.url, reason: summarizeErrorMessage(error) });
+      }
+    }
+
+    return { items: expandedItems, failures: expansionFailures };
+  }
+
+  /**
+   * Download one prefetched link: wait for a download slot, reserve disk space,
+   * claim a resumable partial, then run the retrying download. The outcome is
+   * stored on the slot, so `task` never rejects and the delivery loop can
+   * inspect it when the link's turn comes.
+   */
+  private async prefetchItem(options: {
+    slot: PrefetchSlot;
+    userId: string;
+    total: number;
+    batch: BatchOptions;
+    reporter: BatchProgressReporter;
+  }): Promise<void> {
+    const { slot, userId, total, batch, reporter } = options;
+    const { signal, jobId } = batch;
+
+    try {
+      await this.downloadSlots.acquire(signal);
+
+      try {
+        const releaseDisk = await this.reserveDownloadDisk(signal);
+
+        try {
+          slot.workspace = await this.workspaceManager.create(userId, { reuseDir: slot.resumable?.resumeDir });
+
+          if (jobId !== undefined) {
+            slot.itemId = this.db?.addItem(jobId, slot.item.url, { noProxy: slot.item.noProxy });
+
+            if (slot.itemId !== undefined) {
+              this.db?.setItemResumeDir(slot.itemId, slot.workspace.dirPath);
+            }
+          }
+
+          slot.video = await this.downloadWithRetries({ slot, total, signal, reporter });
+        } finally {
+          releaseDisk?.();
+        }
+      } finally {
+        // Released even when the download failed, so the next prefetched link
+        // (or another chat's link) can start immediately.
+        this.downloadSlots.release();
+      }
+    } catch (error) {
+      slot.error = error;
+
+      // The resume claim clears `job_items.resume_dir`; put it back when the
+      // link never got a workspace (disk guard, abort while queued) so its
+      // partial stays resumable.
+      if (slot.workspace === undefined && slot.resumable !== undefined) {
+        this.db?.setItemResumeDir(slot.resumable.itemId, slot.resumable.resumeDir);
+      }
+    } finally {
+      slot.settled = true;
+      reporter.markFinished(slot.index);
+    }
+  }
+
+  /**
+   * Reserve disk room for one download, waiting briefly when the disk is full
+   * of files that are still being sent: those are deleted once delivered, so a
+   * 4 GB+ batch on a tight disk recovers instead of failing the next link.
+   * Stop aborts the wait through `delay()`.
+   */
+  private async reserveDownloadDisk(signal: AbortSignal): Promise<(() => void) | undefined> {
+    if (this.diskGuard === undefined) {
+      return undefined;
+    }
+
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await this.diskGuard.acquire();
+      } catch (error) {
+        if (!(error instanceof InsufficientDiskSpaceError) || attempt >= this.diskWaitAttempts) {
+          throw error;
+        }
+
+        console.warn(
+          `Download waiting for free disk (attempt ${attempt}/${this.diskWaitAttempts}): ${error.message}`,
+        );
+        await this.delay(this.diskWaitIntervalMs, signal);
+      }
+    }
+  }
+
+  private async downloadWithRetries(options: {
+    slot: PrefetchSlot;
+    total: number;
+    signal: AbortSignal;
+    reporter: BatchProgressReporter;
+  }): Promise<DownloadedVideo> {
+    const { slot, total, signal, reporter } = options;
+    const workspace = slot.workspace;
+
+    if (workspace === undefined) {
+      throw new Error('Workspace unduhan tidak tersedia.');
+    }
+
+    const maxAttempts = Math.max(1, this.downloadRetries);
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (signal.aborted) {
+        throw new DownloadCancelledError();
+      }
+
+      try {
+        return await this.videoDownloader.download({
+          url: slot.item.url,
+          outputDir: workspace.dirPath,
+          signal,
+          noProxy: slot.item.noProxy,
+          onProgress: (progress) => reporter.update(slot.index, progress),
+        });
+      } catch (error) {
+        if (error instanceof DownloadCancelledError) {
+          throw error;
+        }
+
+        lastError = error;
+        console.error(`Download attempt ${attempt}/${maxAttempts} failed for ${slot.item.url}:`, error);
+
+        if (attempt < maxAttempts) {
+          const backoffMs = Math.min(30_000, this.downloadRetryBackoffMs * attempt);
+          await reporter.reportRetry({
+            index: slot.index,
+            attempt,
+            maxAttempts,
+            backoffMs,
+            error,
+            total,
+          });
+          await this.delay(backoffMs, signal);
+        }
+      }
+    }
+
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
 
   /** Abortable sleep used between download retry attempts. */
@@ -386,6 +671,9 @@ export class VideoMessageProcessor {
           `Download selesai. Sedang mengonversi video ke resolusi ${convertToHeight}p...`,
         );
 
+        // Conversion writes a second full copy next to the download.
+        await this.diskGuard?.assertRoomFor(video.fileSize, 'Ruang disk tidak cukup untuk mengonversi video');
+
         video = await this.videoConverter.convert({
           video,
           outputDir,
@@ -408,6 +696,9 @@ export class VideoMessageProcessor {
           acceptedMessage,
           'Download selesai. Sedang memperbaiki dimensi video...',
         );
+
+        // The re-encode writes a second full copy next to the download.
+        await this.diskGuard?.assertRoomFor(video.fileSize, 'Ruang disk tidak cukup untuk memperbaiki dimensi video');
 
         video = await this.videoConverter.convert({
           video,
@@ -455,6 +746,13 @@ export class VideoMessageProcessor {
             ? 'Screenshot selesai. Sedang mengirim video ke Telegram...'
             : 'Sedang mengirim video ke Telegram...',
       );
+
+    // Splitting writes the parts next to the original: on a 4 GB+ video this
+    // needs as much free space as the file itself, so fail early with a clear
+    // reason instead of letting ffmpeg die with ENOSPC halfway through.
+    if (video.fileSize > this.maxFileSizeBytes) {
+      await this.diskGuard?.assertRoomFor(video.fileSize, 'Ruang disk tidak cukup untuk memecah video');
+    }
 
     const segments = await this.videoSplitter.split(video, outputDir, this.maxFileSizeBytes);
 
@@ -577,22 +875,6 @@ export class VideoMessageProcessor {
       );
     } catch (error) {
       console.error('Failed to update conversion progress:', error);
-    }
-  }
-
-  private async reportDownloadProgress(
-    notifier: TelegramNotifier,
-    acceptedMessage: StatusMessage,
-    progress: VideoDownloadProgress,
-  ): Promise<void> {
-    if (progress.status !== 'downloading') {
-      return;
-    }
-
-    try {
-      await notifier.updateProgress(acceptedMessage, formatDownloadProgress(progress));
-    } catch (error) {
-      console.error('Failed to update download progress:', error);
     }
   }
 }
