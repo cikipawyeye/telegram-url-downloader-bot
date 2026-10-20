@@ -63,7 +63,7 @@ Batasnya:
 - `MIN_FREE_DISK_BYTES` (default 6 GiB) dan `DOWNLOAD_RESERVE_BYTES` (default 4 GiB) — sebelum unduhan dimulai, bot memastikan sisa disk masih cukup. Untuk video 4 GB+ yang dipecah menjadi part, satu job butuh ruang untuk file asli **dan** hasil split (sekitar 2x ukuran file), jadi naikkan `MIN_FREE_DISK_BYTES` bila ukuran file biasanya 4 GB atau lebih (mis. `12884901888` = 12 GiB).
 - Kalau ruang tidak cukup, link tersebut gagal dengan alasan yang jelas (bukan error ffmpeg/ENOSPC), dan pesan menyebutkan berapa GB yang tersedia/dibutuhkan.
 - Kalau ruang sedang penuh karena file yang baru dikirim belum dihapus, bot menunggu sekitar 15 detik (sampai 4 kali percobaan) sebelum menyatakan link gagal, sehingga batch video besar di disk ketat tidak langsung putus. Tombol Stop tetap bisa menghentikan penantian ini.
-- Saat pengguna menekan Stop: unduhan yang sudah selesai tetapi belum terkirim dihapus, sedangkan unduhan yang masih berjalan dibiarkan sebagai file parsial supaya bisa dilanjutkan saat link dikirim ulang.
+- Saat pengguna menekan Stop: pesan status langsung berubah menjadi "Unduhan dihentikan." dan tombolnya hilang, termasuk untuk pesan yang masih antre (tidak menunggu batch sebelumnya selesai). Unduhan yang sudah selesai tetapi belum terkirim dihapus, sedangkan unduhan yang masih berjalan dibiarkan sebagai file parsial supaya bisa dilanjutkan saat link dikirim ulang.
 
 ## Penting
 Agar bot bisa mengirim file besar, sebaiknya gunakan **local/self-hosted Telegram Bot API** dan isi `TELEGRAM_API_ROOT`.

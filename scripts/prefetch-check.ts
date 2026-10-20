@@ -406,6 +406,69 @@ async function checkDiskRecoversWhenSpaceFrees(): Promise<void> {
   console.log('[ok] a temporarily full disk waits for space instead of failing');
 }
 
+async function checkQueuedStopConfirmsImmediately(): Promise<void> {
+  const events: string[] = [];
+  const record: Recorder = (event) => events.push(event);
+  const sendMs = 120;
+  const downloader = buildDownloader({
+    record,
+    durations: {
+      'https://example.com/a1': 20,
+      'https://example.com/a2': 20,
+      'https://example.com/queued-stop': 5,
+    },
+  });
+  const processor = buildProcessor({
+    downloader,
+    record,
+    downloadSlots: new DownloadSlots(1),
+  });
+  const chatId = CHAT_ID + 4;
+  const first = buildNotifier({ chatId, messageId: 851, record, sendMs });
+  const queued = buildNotifier({ chatId, messageId: 852, record, sendMs });
+
+  await processor.process({
+    notifier: first,
+    text: 'https://example.com/a1\nhttps://example.com/a2',
+    userId: '1',
+  });
+  await wait(5);
+  await processor.process({
+    notifier: queued,
+    text: 'https://example.com/queued-stop',
+    userId: '1',
+  });
+
+  // The queued batch prefetched its link but is still waiting for its FIFO turn.
+  await waitFor(
+    () => events.includes('download:end:https://example.com/queued-stop'),
+    'the queued batch to finish prefetching',
+  );
+  check(!events.includes('send-start:queued-stop.mp4'), 'the queued batch must not deliver yet');
+
+  check(processor.cancelDownload(852), 'the queued batch must accept the stop');
+
+  await waitFor(() => events.includes('status:stopped'), 'immediate stop confirmation', 1000);
+
+  check(
+    events.includes('send-start:a1.mp4') && !events.includes('send-end:a1.mp4'),
+    `Stop must be confirmed while the previous batch is still sending: ${JSON.stringify(events)}`,
+  );
+
+  // The prefetched 4 GB+ file is dropped immediately to free the disk.
+  await waitFor(
+    () => events.includes('workspace:remove:/tmp/fake-workspace-3'),
+    'immediate cleanup of the stopped prefetch',
+    1000,
+  );
+
+  // With the confirmation the inline keyboard is dropped, so a second tap has
+  // nothing left to cancel.
+  check(!processor.cancelDownload(852), 'a second stop must report nothing running');
+
+  console.log('[ok] stopping a queued batch confirms immediately and frees its files');
+}
+
 async function checkCancelCleanup(): Promise<void> {
   const events: string[] = [];
   const record: Recorder = (event) => events.push(event);
@@ -444,6 +507,12 @@ async function checkCancelCleanup(): Promise<void> {
 
   // The finished-but-undelivered download is removed, the interrupted one is
   // kept as a partial for the resend/resume flow.
+  await waitFor(
+    () => events.includes('workspace:remove:/tmp/fake-workspace-2'),
+    'cleanup of the prefetched, undelivered file',
+    2000,
+  );
+
   check(
     events.includes('workspace:remove:/tmp/fake-workspace-2'),
     `the prefetched, undelivered workspace must be removed: ${JSON.stringify(events)}`,
@@ -465,6 +534,7 @@ async function main(): Promise<void> {
   await checkQueuedBatchPrefetch();
   await checkDiskGuard();
   await checkDiskRecoversWhenSpaceFrees();
+  await checkQueuedStopConfirmsImmediately();
   await checkCancelCleanup();
   console.log('ALL CHECKS PASSED');
 }

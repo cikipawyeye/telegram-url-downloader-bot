@@ -60,12 +60,26 @@ type BatchPrefetch = {
   ready: Promise<{ items: VideoRequestItem[]; expansionFailures: BatchFailure[] }>;
   reporter: BatchProgressReporter;
   slots: PrefetchSlot[];
+  /** True once the per-chat FIFO reached this batch and delivery began. */
+  deliveryStarted: boolean;
   /**
    * Remove the workspaces of downloads that finished but will never be
    * delivered (batch stopped or failed). Downloads that are still running are
    * left alone: their partial file is what a resend resumes from.
    */
   discardUndelivered: () => Promise<void>;
+  /** Stop a batch that has not started delivering yet (queued Stop button). */
+  cancelPending: () => Promise<void>;
+};
+
+/** Bookkeeping for the Stop button: one entry per accepted message. */
+type PendingBatch = {
+  controller: AbortController;
+  notifier: TelegramNotifier;
+  statusMessage: StatusMessage;
+  /** Set right after the accepted status message; used for instant cleanup. */
+  prefetch?: BatchPrefetch;
+  jobId?: number;
 };
 
 
@@ -89,7 +103,7 @@ export class VideoMessageProcessor {
   private readonly diskGuard?: DiskSpaceGuard;
   private readonly diskWaitAttempts: number;
   private readonly diskWaitIntervalMs: number;
-  private readonly pendingCancellations = new Map<number, AbortController>();
+  private readonly pendingCancellations = new Map<number, PendingBatch>();
 
   constructor(options: {
     maxFileSizeBytes: number;
@@ -134,14 +148,33 @@ export class VideoMessageProcessor {
   }
 
   cancelDownload(statusMessageId: number): boolean {
-    const controller = this.pendingCancellations.get(statusMessageId);
+    const pending = this.pendingCancellations.get(statusMessageId);
 
-    if (!controller || controller.signal.aborted) {
+    if (!pending || pending.controller.signal.aborted) {
       return false;
     }
 
-    controller.abort();
+    pending.controller.abort();
     this.pendingCancellations.delete(statusMessageId);
+
+    if (pending.jobId !== undefined) {
+      this.db?.cancelItems(pending.jobId);
+      this.db?.finishJob(pending.jobId, 'cancelled');
+    }
+
+    // A batch that is still waiting for its FIFO turn would otherwise keep
+    // "Link diterima..." (and its Stop button) until the previous batch is done,
+    // so confirm right away and drop the files it already prefetched.
+    if (pending.prefetch !== undefined && !pending.prefetch.deliveryStarted) {
+      void pending.prefetch.cancelPending().catch((error) => {
+        console.error('Failed to clean up the stopped prefetch:', error);
+      });
+    }
+
+    void pending.notifier.confirmStopped(pending.statusMessage).catch((error) => {
+      console.error('Failed to confirm the stopped download:', error);
+    });
+
     return true;
   }
 
@@ -170,7 +203,14 @@ export class VideoMessageProcessor {
       const acceptedMessage = await notifier.sendAccepted();
 
       const controller = new AbortController();
-      this.pendingCancellations.set(acceptedMessage.messageId, controller);
+      // Registered before the Stop button exists, so a very fast tap cannot fall
+      // through to "Tidak ada proses yang sedang berjalan".
+      const pending: PendingBatch = {
+        controller,
+        notifier,
+        statusMessage: acceptedMessage,
+      };
+      this.pendingCancellations.set(acceptedMessage.messageId, pending);
 
       const jobId = this.db?.createJob({
         chatId: notifier.chatId,
@@ -178,6 +218,7 @@ export class VideoMessageProcessor {
         statusMessageId: acceptedMessage.messageId,
         convertHeight: convertToHeight,
       });
+      pending.jobId = jobId;
 
       await notifier.addDownloadStopButton(
         acceptedMessage,
@@ -194,6 +235,7 @@ export class VideoMessageProcessor {
         userId,
         batch: { convertToHeight, forceNoProxy, signal: controller.signal, jobId },
       });
+      pending.prefetch = prefetch;
 
       // Catch here: a rejecting batch must never become an unhandled
       // rejection (it crashes the process and kills the stop button).
@@ -252,6 +294,8 @@ export class VideoMessageProcessor {
     prefetch: BatchPrefetch,
     { convertToHeight, signal, jobId }: BatchOptions,
   ): Promise<void> {
+    prefetch.deliveryStarted = true;
+
     const { items, expansionFailures } = await prefetch.ready;
 
     if (items.length === 0) {
@@ -469,7 +513,23 @@ export class VideoMessageProcessor {
       }
     };
 
-    return { ready, reporter, slots, discardUndelivered };
+    /**
+     * Stop a batch that never reached its delivery turn. Nothing was sent, so
+     * only a download that is still running keeps its partial (a resend resumes
+     * it); files that already finished are deleted to free the disk for the
+     * batch that is actually being delivered.
+     */
+    const cancelPending = async (): Promise<void> => {
+      const first = slots[0];
+
+      if (first !== undefined && first.state === 'pending' && !first.settled) {
+        first.state = 'cancelled';
+      }
+
+      await discardUndelivered();
+    };
+
+    return { ready, reporter, slots, deliveryStarted: false, discardUndelivered, cancelPending };
   }
 
   /** Read the URLs behind the links; album links expand into several videos. */
