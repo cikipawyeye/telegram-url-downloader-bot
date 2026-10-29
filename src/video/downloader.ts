@@ -6,7 +6,20 @@ import * as https from 'node:https';
 import type { IncomingMessage } from 'node:http';
 import path from 'node:path';
 import { type DownloadFinishResult, type VideoProgress as YtDlpVideoProgress, YtDlp } from 'ytdlp-nodejs';
-import { type DownloadedVideo, type VideoDownloadProgress } from './utils.js';
+import {
+  buildMagnetRef,
+  extractMagnetInfoHash,
+  isMagnetUrl,
+  isVideoFileName,
+  magnetMetaCacheDir,
+  parseAria2ProgressLine,
+  parseMagnetRef,
+  parseTorrentMetadata,
+  selectLargestVideoFile,
+  type TorrentFileEntry,
+  type TorrentMetadata,
+} from './magnet.js';
+import { type DownloadedVideo, type VideoDownloadProgress, formatBytes } from './utils.js';
 
 // Sign endpoint that issues a time-limited token for a Bunkr media path.
 const BUNKR_SIGN_ENDPOINT = 'https://glb-apisign.cdn.cr/sign';
@@ -75,6 +88,21 @@ const GDOWN_VERSION_TIMEOUT_MS = 10_000;
 // chatty folder download cannot balloon the memory usage.
 const GDOWN_OUTPUT_TAIL_LIMIT = 4_000;
 
+// Magnet links are downloaded with the external `aria2c` binary (BitTorrent):
+// yt-dlp cannot handle magnet URIs. The flow mirrors the gdown path -- binary
+// probe, spawn, streamed progress, timeout and abort -- with one extra phase:
+// the torrent metadata must be fetched first (`--bt-metadata-only`) so the
+// video files inside the torrent can be listed, then each file is downloaded
+// individually with `--select-file`.
+const ARIA2_BINARY = 'aria2c';
+const ARIA2_VERSION_TIMEOUT_MS = 10_000;
+const ARIA2_OUTPUT_TAIL_LIMIT = 4_000;
+const ARIA2_METADATA_TIMEOUT_MS = 120_000;
+// Extra BitTorrent trackers appended to every magnet download
+// (MAGNET_EXTRA_TRACKERS, comma separated). Magnet links with dead trackers
+// still find peers through these plus the DHT.
+const DEFAULT_MAGNET_EXTRA_TRACKERS = '';
+
 export class DownloadCancelledError extends Error {
   constructor() {
     super('Unduhan dibatalkan oleh pengguna.');
@@ -131,14 +159,30 @@ export class VideoDownloader {
   private readonly downloadTimeoutMs: number;
   private readonly proxy?: string;
   private readonly ytdlp: YtDlp;
+  private readonly magnetMaxFileBytes: number;
+  private readonly magnetExtraTrackers: string;
 
-  constructor(options: { downloadTimeoutMs: number; proxy?: string; ytdlp: YtDlp }) {
+  constructor(options: {
+    downloadTimeoutMs: number;
+    proxy?: string;
+    ytdlp: YtDlp;
+    /** Reject torrent files bigger than this (0 = unlimited). */
+    magnetMaxFileBytes?: number;
+    /** Extra tracker announce URIs for magnet downloads (comma separated). */
+    magnetExtraTrackers?: string;
+  }) {
     this.downloadTimeoutMs = options.downloadTimeoutMs;
     this.proxy = options.proxy;
     this.ytdlp = options.ytdlp;
+    this.magnetMaxFileBytes = options.magnetMaxFileBytes ?? 0;
+    this.magnetExtraTrackers = options.magnetExtraTrackers ?? DEFAULT_MAGNET_EXTRA_TRACKERS;
   }
 
-  async expandUrl(url: string): Promise<string[]> {
+  async expandUrl(url: string, options: { noProxy?: boolean } = {}): Promise<string[]> {
+    if (isMagnetUrl(url)) {
+      return await this.expandMagnet(url, options.noProxy === true);
+    }
+
     if (!isBunkrAlbumUrl(url)) {
       return [url];
     }
@@ -178,6 +222,10 @@ export class VideoDownloader {
   }
 
   async download(options: DownloadVideoOptions): Promise<DownloadedVideo> {
+    if (isMagnetUrl(options.url)) {
+      return await this.downloadFromMagnet(options);
+    }
+
     if (isBunkrFileUrl(options.url)) {
       const fileUrl = await this.fetchBunkDownloaderPageUrl(options.url);
       return await this.download({ ...options, url: fileUrl });
@@ -292,6 +340,365 @@ export class VideoDownloader {
     await cleanupGdownPartials(outputDir);
     onProgress?.({ status: 'finished', downloadedBytes: result.fileSize });
     return result;
+  }
+
+  /**
+   * Expand a magnet link into one `#file=N` ref per video file it contains,
+   * in torrent order. Torrent metadata must be fetched over BitTorrent first
+   * (there is no way around it), so this runs one `aria2c --bt-metadata-only`
+   * pass and caches the resulting .torrent by info hash for the download
+   * phase. Non-video files (samples, .txt, .nfo, ...) are dropped; a torrent
+   * without any video file fails the link with a clear reason.
+   */
+  private async expandMagnet(url: string, noProxy: boolean): Promise<string[]> {
+    const { magnet } = parseMagnetRef(url);
+    const { metadata } = await this.fetchMagnetMetadata(magnet, noProxy);
+    const videoFiles = metadata.files.filter((file) =>
+      isVideoFileName(file.pathParts[file.pathParts.length - 1]),
+    );
+
+    if (videoFiles.length === 0) {
+      throw new Error('Torrent tidak berisi file video.');
+    }
+
+    return videoFiles.map((file) => buildMagnetRef(magnet, file.index));
+  }
+
+  /**
+   * Resolve the torrent metadata (file list + info hash) behind a magnet URI.
+   * The result is cached as `<cache dir>/<hex info hash>.torrent`, so the
+   * expand phase and the per-file download phase (and any resend) share one
+   * metadata fetch. Missing aria2 and unreachable swarms surface as clear
+   * errors: the caller reports them per link.
+   */
+  private async fetchMagnetMetadata(
+    magnet: string,
+    noProxy: boolean,
+  ): Promise<{ metadata: TorrentMetadata; torrentPath: string }> {
+    const binary = await resolveAria2Binary();
+    if (binary === undefined) {
+      throw new Error('Link magnet butuh binary aria2c yang belum terpasang di server.');
+    }
+
+    // A hex info hash names the cache file directly; base32 magnets skip the
+    // lookup and cache under their decoded hex hash after the fetch.
+    const magnetHash = extractMagnetInfoHash(magnet);
+    const cacheDir = magnetMetaCacheDir();
+    const directCacheFile = magnetHash !== undefined && /^[0-9a-f]{40}$/.test(magnetHash)
+      ? path.join(cacheDir, `${magnetHash}.torrent`)
+      : undefined;
+
+    if (directCacheFile !== undefined) {
+      const cached = await readTorrentFile(directCacheFile);
+      if (cached !== undefined) {
+        return { metadata: cached, torrentPath: directCacheFile };
+      }
+    }
+
+    // Fetch into a private temp dir so the "do not overwrite existing
+    // metadata" behaviour of --bt-save-metadata can never pick up a foreign
+    // file, then move the result into the cache under a stable name.
+    await fsp.mkdir(cacheDir, { recursive: true });
+    const fetchDir = await fsp.mkdtemp(path.join(cacheDir, 'meta-'));
+
+    try {
+      const runResult = await this.runAria2Process({
+        aria2Binary: binary,
+        args: [
+          '--no-conf',
+          '--bt-metadata-only=true',
+          '--bt-save-metadata=true',
+          '--seed-time=0',
+          '--summary-interval=0',
+          `--dir=${fetchDir}`,
+          ...this.buildAria2ProxyArgs(noProxy),
+          ...this.buildAria2TrackerArgs(),
+          magnet,
+        ],
+        timeoutMs: ARIA2_METADATA_TIMEOUT_MS,
+        noProxy,
+      });
+
+      if (runResult.code !== 0) {
+        const detail = extractAria2ErrorDetail(runResult.outputTail);
+        throw new Error(
+          `Gagal mengambil metadata torrent (exit ${runResult.code ?? 'signal'})${detail ? `: ${detail}` : ''}`,
+        );
+      }
+
+      const savedTorrent = await findSavedTorrent(fetchDir);
+      if (savedTorrent === undefined) {
+        throw new Error('Metadata torrent tidak ditemukan (tidak ada peer yang merespons). Coba lagi nanti.');
+      }
+
+      const metadata = await readTorrentFile(savedTorrent);
+      if (metadata === undefined) {
+        throw new Error('Metadata torrent tidak dapat dibaca.');
+      }
+
+      const cacheFile = path.join(cacheDir, `${metadata.infoHashHex}.torrent`);
+      await fsp.copyFile(savedTorrent, cacheFile).catch(() => undefined);
+      return { metadata, torrentPath: cacheFile };
+    } finally {
+      await fsp.rm(fetchDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Download one file of a magnet link with `aria2c --select-file`. The target
+   * file comes from the parsed torrent metadata (exact output path), so the
+   * result is resolved deterministically -- no guessing by file size. A resend
+   * resumes automatically: aria2 keeps its `<name>.aria2` control file next to
+   * the partial, and a workspace that already holds the complete file skips
+   * straight to delivery.
+   */
+  private async downloadFromMagnet(options: DownloadVideoOptions): Promise<DownloadedVideo> {
+    const { magnet, fileIndex } = parseMagnetRef(options.url);
+    const { metadata, torrentPath } = await this.fetchMagnetMetadata(magnet, options.noProxy === true);
+
+    const entry = this.selectMagnetEntry(metadata, fileIndex);
+    const fileName = entry.pathParts[entry.pathParts.length - 1];
+
+    if (this.magnetMaxFileBytes > 0 && entry.length > this.magnetMaxFileBytes) {
+      throw new Error(
+        `File torrent "${fileName}" (${formatBytes(entry.length)}) melebihi batas ${formatBytes(this.magnetMaxFileBytes)}.`,
+      );
+    }
+
+    await fsp.mkdir(options.outputDir, { recursive: true });
+    const outputPath = path.join(options.outputDir, ...entry.pathParts);
+    const existing = await fsp.stat(outputPath).catch(() => undefined);
+
+    if (existing !== undefined && existing.size >= entry.length) {
+      // The workspace already holds the complete file (earlier attempt that
+      // failed later in the pipeline): deliver it without hitting the swarm.
+      const metadataProbe = await this.resolveVideoMetadata(outputPath, {});
+      options.onProgress?.({ status: 'finished', downloadedBytes: existing.size });
+      return {
+        filePath: outputPath,
+        fileSize: existing.size,
+        title: fileTitle(entry),
+        durationSeconds: metadataProbe.durationSeconds,
+        width: metadataProbe.width,
+        height: metadataProbe.height,
+      };
+    }
+
+    const binary = await resolveAria2Binary();
+    if (binary === undefined) {
+      throw new Error('Link magnet butuh binary aria2c yang belum terpasang di server.');
+    }
+
+    const runResult = await this.runAria2Process({
+      aria2Binary: binary,
+      args: [
+        '--no-conf',
+        `--select-file=${entry.index}`,
+        `--dir=${options.outputDir}`,
+        // `trunc` is instant on every filesystem (falloc is not universally
+        // available and prealloc blocks for seconds on multi-GB files).
+        '--file-allocation=trunc',
+        // Stop seeding the moment the download completes: the bot delivers
+        // files, it is not a long-lived seeder.
+        '--seed-time=0',
+        '--seed-ratio=0',
+        '--auto-file-renaming=false',
+        '--summary-interval=2',
+        '--console-log-level=warn',
+        ...this.buildAria2ProxyArgs(options.noProxy === true),
+        ...this.buildAria2TrackerArgs(),
+        torrentPath,
+      ],
+      timeoutMs: this.downloadTimeoutMs,
+      noProxy: options.noProxy === true,
+      onProgress: options.onProgress,
+      signal: options.signal,
+    });
+
+    if (runResult.code !== 0) {
+      const detail = extractAria2ErrorDetail(runResult.outputTail);
+      throw new Error(`Download torrent gagal (exit ${runResult.code ?? 'signal'})${detail ? `: ${detail}` : ''}`);
+    }
+
+    const stat = await fsp.stat(outputPath).catch(() => undefined);
+    if (stat === undefined) {
+      throw new Error(`File hasil download torrent tidak ditemukan (${fileName}).`);
+    }
+
+    const metadataProbe = await this.resolveVideoMetadata(outputPath, {});
+    options.onProgress?.({ status: 'finished', downloadedBytes: stat.size });
+
+    return {
+      filePath: outputPath,
+      fileSize: stat.size,
+      title: fileTitle(entry),
+      durationSeconds: metadataProbe.durationSeconds,
+      width: metadataProbe.width,
+      height: metadataProbe.height,
+    };
+  }
+
+  /** Pick the requested torrent file, or the biggest video when none is tagged. */
+  private selectMagnetEntry(metadata: TorrentMetadata, fileIndex?: number): TorrentFileEntry {
+    if (fileIndex === undefined) {
+      const fallback = selectLargestVideoFile(metadata.files);
+      if (fallback === undefined) {
+        throw new Error('Torrent tidak berisi file video.');
+      }
+      return fallback;
+    }
+
+    const entry = metadata.files.find((file) => file.index === fileIndex);
+    if (entry === undefined) {
+      throw new Error(`File #${fileIndex} tidak ada di dalam torrent.`);
+    }
+    return entry;
+  }
+
+  /**
+   * Spawn one aria2 run and wait for it, streaming console readout progress
+   * to `onProgress`. Like `runGdownProcess`, a non-zero exit resolves with
+   * the code and output tail (the caller reports); aborts and spawn errors
+   * reject with `DownloadCancelledError` / the transport error.
+   */
+  private async runAria2Process(options: {
+    aria2Binary: string;
+    args: string[];
+    timeoutMs: number;
+    noProxy: boolean;
+    onProgress?: (progress: VideoDownloadProgress) => void;
+    signal?: AbortSignal;
+  }): Promise<{ code: number | null; outputTail: string }> {
+    const child = spawn(options.aria2Binary, options.args, {
+      env: this.buildAria2Env(options.noProxy),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let outputTail = '';
+    let exitCode: number | null = null;
+    const handleChunk = (chunk: Buffer) => {
+      const text = String(chunk);
+      outputTail = (outputTail + text).slice(-ARIA2_OUTPUT_TAIL_LIMIT);
+      for (const line of text.split(/[\r\n]+/)) {
+        const progress = parseAria2ProgressLine(line);
+        if (progress !== undefined) {
+          options.onProgress?.(progress);
+        }
+      }
+    };
+
+    child.stdout.on('data', handleChunk);
+    child.stderr.on('data', handleChunk);
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+
+      const cleanup = () => {
+        clearTimeout(timer);
+        options.signal?.removeEventListener('abort', onAbort);
+      };
+
+      const onAbort = () => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
+        child.kill('SIGKILL');
+        reject(new DownloadCancelledError());
+      };
+
+      const timer = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
+        child.kill('SIGKILL');
+        reject(new Error(`Proses download torrent timeout setelah ${Math.round(options.timeoutMs / 1000)} detik.`));
+      }, options.timeoutMs);
+
+      child.on('error', (error) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
+        reject(error);
+      });
+
+      child.on('close', (code) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
+        exitCode = code;
+        resolve();
+      });
+
+      if (options.signal) {
+        if (options.signal.aborted) {
+          onAbort();
+          return;
+        }
+
+        options.signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
+
+    return { code: exitCode, outputTail };
+  }
+
+  /**
+   * aria2 proxy flags. Like the other download paths the configured proxy is
+   * applied per run and the "no proxy" override strips it entirely (aria2 also
+   * reads the *_proxy environment variables, see `buildAria2Env`).
+   */
+  private buildAria2ProxyArgs(noProxy: boolean): string[] {
+    if (noProxy || !this.proxy) {
+      return [];
+    }
+    return [`--all-proxy=${this.proxy}`];
+  }
+
+  /** Extra tracker URIs (MAGNET_EXTRA_TRACKERS) appended to every magnet run. */
+  private buildAria2TrackerArgs(): string[] {
+    const trackers = this.magnetExtraTrackers.trim();
+    return trackers.length > 0 ? [`--bt-tracker=${trackers}`] : [];
+  }
+
+  /**
+   * Environment for one aria2 run. aria2 follows the *_proxy environment
+   * variables in addition to `--all-proxy`, so the "no proxy" override strips
+   * them and the configured proxy fills them in (matching the yt-dlp
+   * `--proxy ""` semantics used elsewhere).
+   */
+  private buildAria2Env(noProxy: boolean): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    const proxyKeys = [
+      'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
+      'http_proxy', 'https_proxy', 'all_proxy',
+    ];
+
+    if (noProxy) {
+      for (const key of proxyKeys) {
+        delete env[key];
+      }
+      return env;
+    }
+
+    if (this.proxy) {
+      for (const key of proxyKeys) {
+        env[key] = this.proxy;
+      }
+    }
+
+    return env;
   }
 
   /**
@@ -1015,6 +1422,108 @@ function spawnGdownVersionProbe(): Promise<string | undefined> {
       resolve(code === 0 ? configuredGdownBinary() : undefined);
     });
   });
+}
+
+// --- aria2 (magnet) helpers -----------------------------------------------
+
+type Aria2BinaryProbe = {
+  at: number;
+  promise: Promise<string | undefined>;
+};
+
+let aria2BinaryProbe: Aria2BinaryProbe | undefined;
+
+const DEFAULT_ARIA2_BINARY_RECHECK_MS = 5 * 60_000;
+
+function aria2BinaryRecheckMs(): number {
+  const raw = Number(process.env.ARIA2_BINARY_RECHECK_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_ARIA2_BINARY_RECHECK_MS;
+}
+
+/**
+ * Detect the aria2c binary with `aria2c --version`, caching the result for the
+ * recheck cooldown (same policy as `resolveGdownBinary`). Returns the binary
+ * path when available, otherwise undefined. Exported for scripts/magnet-check.ts.
+ */
+export function resolveAria2Binary(): Promise<string | undefined> {
+  const probe = aria2BinaryProbe;
+
+  if (probe !== undefined && Date.now() - probe.at < aria2BinaryRecheckMs()) {
+    return probe.promise;
+  }
+
+  const promise = spawnAria2VersionProbe();
+  aria2BinaryProbe = { at: Date.now(), promise };
+  return promise;
+}
+
+/** Optional explicit path to aria2c via ARIA2_BINARY_PATH (see GDOWN_BINARY_PATH). */
+function configuredAria2Binary(): string {
+  const configured = process.env.ARIA2_BINARY_PATH?.trim();
+  return configured !== undefined && configured.length > 0 ? configured : ARIA2_BINARY;
+}
+
+function spawnAria2VersionProbe(): Promise<string | undefined> {
+  return new Promise<string | undefined>((resolve) => {
+    const child = spawn(configuredAria2Binary(), ['--version'], { stdio: 'ignore' });
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      resolve(undefined);
+    }, ARIA2_VERSION_TIMEOUT_MS);
+
+    child.on('error', () => {
+      clearTimeout(timer);
+      resolve(undefined);
+    });
+
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve(code === 0 ? configuredAria2Binary() : undefined);
+    });
+  });
+}
+
+/**
+ * Pull the meaningful error lines out of a failed aria2 run: the output tail
+ * mixes console readout frames with NOTICE noise, so keep ERROR/Exception
+ * lines (tracker failures, swarm errors) and drop the rest.
+ */
+export function extractAria2ErrorDetail(outputTail: string, maxLines = 3): string {
+  const meaningful = outputTail
+    .split(/[\r\n]+/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .filter((line) => (
+      /\[(ERROR|WARN)\]/i.test(line) ||
+      /^(Exception|errorCode|Exception:)/i.test(line) ||
+      /failed|error|denied|refused/i.test(line)
+    ))
+    .filter((line) => parseAria2ProgressLine(line) === undefined);
+
+  const detail = meaningful.slice(-maxLines).join(' | ');
+  return detail.length > 300 ? `${detail.slice(0, 299)}…` : detail;
+}
+
+/** The single .torrent file `--bt-save-metadata` left in the fetch directory. */
+async function findSavedTorrent(dir: string): Promise<string | undefined> {
+  const entries = await fsp.readdir(dir).catch(() => [] as string[]);
+  const torrent = entries.find((entry) => entry.endsWith('.torrent'));
+  return torrent === undefined ? undefined : path.join(dir, torrent);
+}
+
+/** Parse a cached/downloaded .torrent; undefined when missing or malformed. */
+async function readTorrentFile(torrentPath: string): Promise<TorrentMetadata | undefined> {
+  try {
+    return parseTorrentMetadata(await fsp.readFile(torrentPath));
+  } catch {
+    return undefined;
+  }
+}
+
+/** Delivery title for a torrent entry: its file name without the extension. */
+function fileTitle(entry: TorrentFileEntry): string {
+  const fileName = entry.pathParts[entry.pathParts.length - 1];
+  return path.basename(fileName, path.extname(fileName)) || 'video';
 }
 
 // Exported for scripts/gdown-check.ts.

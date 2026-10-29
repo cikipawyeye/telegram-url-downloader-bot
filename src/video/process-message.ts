@@ -542,7 +542,9 @@ export class VideoMessageProcessor {
 
     for (const item of items) {
       try {
-        const expandedUrls = await this.videoDownloader.expandUrl(item.url);
+        const expandedUrls = await this.videoDownloader.expandUrl(item.url, {
+          noProxy: item.noProxy || forceNoProxy,
+        });
         expandedItems.push(
           ...expandedUrls.map((url) => ({ url, noProxy: item.noProxy || forceNoProxy })),
         );

@@ -60,6 +60,8 @@ async function bootstrap(): Promise<void> {
       downloadTimeoutMs: config.downloadTimeoutMs,
       proxy: config.ytdlpProxy,
       ytdlp: new YtDlp(),
+      magnetMaxFileBytes: config.magnetMaxFileBytes,
+      magnetExtraTrackers: config.magnetExtraTrackers,
     }),
     videoScreenshotGenerator: new VideoScreenshotGenerator({
       commandTimeoutMs: Math.min(config.downloadTimeoutMs, 120_000),

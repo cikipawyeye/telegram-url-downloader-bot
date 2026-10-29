@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { extractMagnetInfoHash, parseMagnetRef } from './magnet.js';
 
 export type DownloadedVideo = {
   filePath: string;
@@ -34,7 +35,10 @@ type ScreenshotPlanItem = {
 };
 
 export function extractUrls(text: string): string[] {
-  return [...text.matchAll(/https?:\/\/[^\s]+/gi)]
+  // The magnet alternative must come first: a magnet URI embeds tracker URLs
+  // (`&tr=https://...`), and scanning it as a whole keeps those from being
+  // picked up as separate links.
+  return [...text.matchAll(/magnet:\?[^\s]+|https?:\/\/[^\s]+/gi)]
     .map((match) => match[0].replace(/[),.!?;:]+$/g, ''))
     .filter((url, index, urls) => urls.indexOf(url) === index);
 }
@@ -112,6 +116,16 @@ export function parseVideoRequestItems(text: string): VideoRequestItem[] {
  */
 export function downloadIdentity(url: string): string {
   const trimmed = url.trim();
+
+  // Magnet links: the info hash names the torrent and the internal #file
+  // fragment names the file inside it. Tracker lists (`&tr=...`) and display
+  // names (`&dn=...`) may vary between copies of the same magnet, so they are
+  // deliberately left out of the identity.
+  const magnetInfoHash = extractMagnetInfoHash(trimmed);
+  if (magnetInfoHash !== undefined) {
+    const { fileIndex } = parseMagnetRef(trimmed);
+    return `magnet:${magnetInfoHash}${fileIndex !== undefined ? `:file-${fileIndex}` : ''}`;
+  }
 
   const bunkrId = extractBunkrFileIdentity(trimmed);
   if (bunkrId !== undefined) {

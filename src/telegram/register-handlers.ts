@@ -18,7 +18,7 @@ export const CONVERT_RESOLUTIONS = [1080, 720, 480, 240] as const;
 const HELP_TEXT = [
   'Cara menggunakan bot ini:',
   '',
-  '1. Kirimkan link video (YouTube, TikTok, dsb.) sebagai pesan biasa.',
+  '1. Kirimkan link video (YouTube, TikTok, dsb.) atau link magnet torrent sebagai pesan biasa.',
   '2. Untuk bulk download, kirim beberapa link dalam satu pesan (maksimal 10 link).',
   '3. Bot akan mengunduh videonya lalu mengirimkannya kembali sebagai video yang bisa di-stream langsung di Telegram.',
   '',
@@ -34,7 +34,7 @@ const HELP_TEXT = [
   'Catatan: video yang dikirim dalam satu album (media group) akan dikompres Telegram.',
 ].join('\n');
 
-const URL_PATTERN = /https?:\/\/\S+/i;
+const URL_PATTERN = /(?:https?:\/\/|magnet:\?)\S+/i;
 
 const RESOLUTION_MENU_TEXT = [
   'Pilih resolusi video yang diinginkan.',

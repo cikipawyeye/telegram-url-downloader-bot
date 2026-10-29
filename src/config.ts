@@ -22,6 +22,10 @@ export type AppConfig = {
   screenshotCount: number;
   sendVideoInAlbum: boolean;
   reencodeAnamorphic: boolean;
+  /** Reject individual torrent files bigger than this (0 = unlimited). */
+  magnetMaxFileBytes: number;
+  /** Extra BitTorrent tracker URIs for magnet downloads (comma separated). */
+  magnetExtraTrackers: string;
 };
 
 export function loadConfig(): AppConfig {
@@ -68,6 +72,10 @@ export function loadConfig(): AppConfig {
     screenshotCount: Number(process.env.SCREENSHOT_COUNT ?? 5),
     sendVideoInAlbum: process.env.SEND_VIDEO_IN_ALBUM !== 'false',
     reencodeAnamorphic: process.env.REENCODE_ANAMORPHIC !== 'false',
+    // Torrent downloads can be huge and Telegram cannot deliver them anyway;
+    // 8 GiB per file is a sane ceiling (split parts still apply downstream).
+    magnetMaxFileBytes: readNonNegativeNumber(process.env.MAGNET_MAX_FILE_SIZE_BYTES, 8 * 1024 * 1024 * 1024),
+    magnetExtraTrackers: process.env.MAGNET_EXTRA_TRACKERS ?? '',
   };
 }
 

@@ -12,6 +12,7 @@ Bot ini menerima URL dari user, mencoba mengunduh videonya dengan `yt-dlp`, lalu
 - unduh Bunkr (`https://*.bunkr.*/file/<id>` atau `/f/<id>`) pakai custom downloader (detail API → sign token → media), dengan dukung progress & batalkan
 - URL album Bunkr (`/a/<id>`) otomatis diperluas menjadi bulk download video saja; gambar diabaikan
 - link Google Drive (`drive.google.com`, `docs.google.com/uc?id=...`) diunduh dengan binary `gdown` kalau tersedia (termasuk link folder via `--folder`), lengkap dengan progress; tanpa `gdown`, otomatis fallback ke `yt-dlp`
+- link magnet torrent (`magnet:?xt=urn:btih:...`) diunduh dengan binary `aria2c`: metadata torrent diambil dulu, lalu setiap file video di dalamnya dikirim berurutan sebagai video terpisah (file non-video diabaikan); ada progress per file, batas ukuran per file (`MAGNET_MAX_FILE_SIZE_BYTES`), dan resume otomatis saat link dikirim ulang
 - kirim kembali memakai `sendVideo` + `supports_streaming: true`
 - kalau ada link yang gagal, alasan errornya ditampilkan di pesan status (per link dan di ringkasan akhir), bukan hanya jumlah keberhasilan/gagal
 - auto cleanup file sementara
