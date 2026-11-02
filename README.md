@@ -18,6 +18,7 @@ Bot ini menerima URL dari user, mencoba mengunduh videonya dengan `yt-dlp`, lalu
 - auto cleanup file sementara
 - auto split video yang melebihi batas upload menjadi beberapa part
 - menu `/convert` untuk mengubah ukuran video ke resolusi 1080p / 720p / 480p / 240p (kompatibel streaming di Telegram)
+- tag/label unduhan: `/tag <nama>` menandai unduhan berikutnya, `/tags` melihat daftar tag beserta jumlahnya, dan `/tags <nama>` melihat riwayat unduhan per tag (tersimpan di SQLite)
 - screenshot + video dikirim dalam satu album/media group (bisa dimatikan dengan `SEND_VIDEO_IN_ALBUM=false`)
 - health check endpoint
 
@@ -31,6 +32,7 @@ src/
   config.ts                 # load environment config
   http/                     # Express app dan endpoint health check
   storage/                  # workspace temp file + disk admission guard
+  tags/                     # normalisasi tag dan teks daftar/riwayat tag
   telegram/                 # handler, notifier, dan pengambil file dari Telegram
   video/                    # download, prefetch/limit unduhan, screenshot, util, dan flow utama
 ```
@@ -145,6 +147,24 @@ Detail teknis:
 - Bot API standar hanya bisa mengunduh file sampai **20 MB**. Kalau video yang di-reply lebih besar dari itu dan bot memakai Bot API standar, proses gagal cepat dengan pesan yang menyarankan `TELEGRAM_API_ROOT`. (Local Bot API server bisa mengunduh tanpa batas ukuran juga untuk audio ini.)
 - Audio dikirim memakai antrian media yang sama seperti video/screenshot sehingga urutan pesan per chat tetap konsisten.
 - Seperti unduhan video, proses `/audio` menampilkan progres (mengambil file → mengekstrak → mengirim) dan punya tombol ⏹ Hentikan Unduhan yang bisa dibatalkan lewat pesan status. Catatan: alur ini stateless dan tidak dicatat di tabel `jobs`/`job_items` (tabel itu khusus batch URL).
+
+## Tag unduhan (`/tag` & `/tags`)
+Tag adalah label yang menempel pada unduhan, berguna untuk mengelompokkan dan mencari riwayat link yang pernah dikirim.
+
+Cara pakai:
+- `/tag film` — tag aktif untuk **pesan link berikutnya**. Kirim satu link atau beberapa link sekaligus; semuanya tercatat dengan tag `film`.
+- `/tags` — daftar tag di chat ini beserta jumlah unduhannya (terbaru lebih dulu, maksimal 20 tag).
+- `/tags film` — 10 riwayat unduhan terakhir dengan tag `film`: status (✅ selesai / ❌ gagal / ⏹ dibatalkan), ukuran file, waktu, dan URL.
+- `/tag` tanpa argumen — menampilkan tag aktif beserta petunjuk.
+- `/tag off` (juga `-`, `hapus`, dan `clear`) — membatalkan tag aktif.
+
+Detail teknis:
+- Tag dinormalisasi sebelum disimpan: dijadikan huruf kecil, `#` di depan dibuang, spasi/tanda baca diubah menjadi `-`, maksimal 32 karakter. Jadi `#Film Korea` dan `film korea` sama-sama menjadi tag `film-korea`.
+- Tag bersifat **sekali pakai** (one-shot) untuk satu pesan; setelah pesan link diterima, tag aktif dihapus. Tag juga kedaluwarsa sendiri setelah 1 jam kalau tidak dipakai.
+- Tag disimpan per file di kolom `job_items.tag`, jadi ekspansi album (Bunkr/magnet) menandai semua file hasil ekspansi dengan tag yang sama.
+- Riwayat dibatasi per chat: di grup, semua anggota melihat riwayat chat tersebut; di private chat, riwayat milik chat itu.
+- Riwayat hanya berisi unduhan yang sempat dibuatkan item (kolom `job_items`); link yang gagal total sebelum unduhan dimulai tidak tercatat.
+- Tag tidak mengubah caption video yang dikirim; pesan status "Link diterima" menampilkan tag yang aktif.
 
 ## Google Drive dengan `gdown`
 Link Google Drive (`https://drive.google.com/file/d/.../view`, `.../open?id=...`, `.../uc?id=...`, `https://drive.usercontent.google.com/download?id=...`) otomatis diunduh memakai binary `gdown` **jika binary tersebut tersedia di PATH**; kalau tidak ada, bot tetap mencoba lewat `yt-dlp` seperti biasa.

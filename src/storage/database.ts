@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 const MIGRATIONS: Array<{ version: number; sql: string }> = [
   {
@@ -92,6 +92,27 @@ const MIGRATIONS: Array<{ version: number; sql: string }> = [
       ALTER TABLE job_items ADD COLUMN resume_dir TEXT;
     `,
   },
+  {
+    version: 4,
+    sql: `
+      -- Per URL: the user's tag/label (the /tag command). NULL means untagged.
+      -- Values are normalized before they reach the database (lowercase,
+      -- punctuation collapsed to "-"), so GROUP BY tag is already canonical.
+      ALTER TABLE job_items ADD COLUMN tag TEXT;
+
+      CREATE INDEX IF NOT EXISTS idx_job_items_tag ON job_items(tag);
+
+      -- The tag of the next message, per chat. Same one-shot cache pattern as
+      -- pending_conversions: kept in the DB so it survives a restart, and
+      -- expired after PENDING_TAG_TTL_SECONDS so a forgotten tag cannot label
+      -- downloads days later.
+      CREATE TABLE IF NOT EXISTS pending_tags (
+        chat_id    INTEGER PRIMARY KEY,
+        tag        TEXT NOT NULL,
+        created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+      );
+    `,
+  },
 ];
 
 export class BotDatabase {
@@ -169,6 +190,38 @@ export class BotDatabase {
     ).run(BotDatabase.PENDING_CONVERSION_TTL_SECONDS);
   }
 
+  // ---- pending tags -----------------------------------------------------
+
+  /** A tag forgotten for a whole hour is stale: the user meant one batch. */
+  static readonly PENDING_TAG_TTL_SECONDS = 60 * 60;
+
+  getPendingTag(chatId: number): string | undefined {
+    this.expireStalePendingTags();
+
+    const row = this.db
+      .prepare('SELECT tag FROM pending_tags WHERE chat_id = ?')
+      .get(chatId) as { tag: string } | undefined;
+
+    return row?.tag;
+  }
+
+  setPendingTag(chatId: number, tag: string): void {
+    this.db.prepare(
+      `INSERT INTO pending_tags (chat_id, tag) VALUES (?, ?)
+       ON CONFLICT(chat_id) DO UPDATE SET tag = excluded.tag, created_at = excluded.created_at`,
+    ).run(chatId, tag);
+  }
+
+  deletePendingTag(chatId: number): void {
+    this.db.prepare('DELETE FROM pending_tags WHERE chat_id = ?').run(chatId);
+  }
+
+  private expireStalePendingTags(): void {
+    this.db.prepare(
+      'DELETE FROM pending_tags WHERE created_at < strftime(\'%s\', \'now\') - ?',
+    ).run(BotDatabase.PENDING_TAG_TTL_SECONDS);
+  }
+
   // ---- jobs -------------------------------------------------------------
 
   createJob(input: {
@@ -215,10 +268,10 @@ export class BotDatabase {
 
   // ---- job items --------------------------------------------------------
 
-  addItem(jobId: number, url: string, options: { noProxy?: boolean } = {}): number {
+  addItem(jobId: number, url: string, options: { noProxy?: boolean; tag?: string } = {}): number {
     const result = this.db
-      .prepare('INSERT INTO job_items (job_id, url, no_proxy) VALUES (?, ?, ?)')
-      .run(jobId, url, options.noProxy === true ? 1 : 0);
+      .prepare('INSERT INTO job_items (job_id, url, no_proxy, tag) VALUES (?, ?, ?, ?)')
+      .run(jobId, url, options.noProxy === true ? 1 : 0, options.tag ?? null);
 
     return Number(result.lastInsertRowid);
   }
@@ -241,6 +294,56 @@ export class BotDatabase {
       `UPDATE job_items SET status = 'cancelled', finished_at = strftime('%s', 'now')
        WHERE job_id = ? AND status = 'pending'`,
     ).run(jobId);
+  }
+
+  // ---- tags -------------------------------------------------------------
+
+  /**
+   * Tags used in this chat with their download counts, newest use first.
+   * `job_items.tag` is already normalized, so no case folding is needed here.
+   */
+  listTags(chatId: number, limit = 20): Array<{ tag: string; total: number; lastUsedAt: number }> {
+    return this.db
+      .prepare(
+        `SELECT job_items.tag AS tag,
+                COUNT(*) AS total,
+                MAX(COALESCE(job_items.finished_at, job_items.created_at)) AS lastUsedAt
+           FROM job_items JOIN jobs ON jobs.id = job_items.job_id
+          WHERE jobs.chat_id = ? AND job_items.tag IS NOT NULL
+          GROUP BY job_items.tag
+          ORDER BY lastUsedAt DESC, job_items.tag ASC
+          LIMIT ?`,
+      )
+      .all(chatId, limit) as Array<{ tag: string; total: number; lastUsedAt: number }>;
+  }
+
+  /** Newest downloads of this chat that carry the tag, for `/tags <nama>`. */
+  listItemsByTag(chatId: number, tag: string, limit = 10): Array<{
+    url: string;
+    title: string | null;
+    status: 'pending' | 'done' | 'failed' | 'cancelled';
+    fileSizeBytes: number | null;
+    finishedAt: number | null;
+  }> {
+    return this.db
+      .prepare(
+        `SELECT job_items.url AS url,
+                job_items.title AS title,
+                job_items.status AS status,
+                job_items.file_size_bytes AS fileSizeBytes,
+                job_items.finished_at AS finishedAt
+           FROM job_items JOIN jobs ON jobs.id = job_items.job_id
+          WHERE jobs.chat_id = ? AND job_items.tag = ?
+          ORDER BY job_items.id DESC
+          LIMIT ?`,
+      )
+      .all(chatId, tag, limit) as Array<{
+        url: string;
+        title: string | null;
+        status: 'pending' | 'done' | 'failed' | 'cancelled';
+        fileSizeBytes: number | null;
+        finishedAt: number | null;
+      }>;
   }
 
   // ---- download resume -----------------------------------------------------

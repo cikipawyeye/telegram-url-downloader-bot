@@ -21,6 +21,8 @@ export type ProcessVideoMessageRequest = {
   convertToHeight?: number;
   /** Force a direct connection (no proxy) for every URL in this message. */
   noProxy?: boolean;
+  /** Label stored on every job item of this message (the /tag command). */
+  tag?: string;
 };
 
 type BatchOptions = {
@@ -28,6 +30,8 @@ type BatchOptions = {
   forceNoProxy: boolean;
   signal: AbortSignal;
   jobId?: number;
+  /** Tag of the message's pending /tag selection, applied to every item. */
+  tag?: string;
 };
 
 /**
@@ -178,7 +182,7 @@ export class VideoMessageProcessor {
     return true;
   }
 
-  async process({ notifier, text, userId, convertToHeight, noProxy }: ProcessVideoMessageRequest): Promise<void> {
+  async process({ notifier, text, userId, convertToHeight, noProxy, tag }: ProcessVideoMessageRequest): Promise<void> {
     const items = parseVideoRequestItems(text.trim());
     // `/noproxy` forces every link of the message, while the marker inside the
     // text only opts out the links it shares a line with (or follows).
@@ -200,7 +204,11 @@ export class VideoMessageProcessor {
     }
 
     try {
-      const acceptedMessage = await notifier.sendAccepted();
+      const acceptedMessage = await notifier.sendAccepted(
+        tag === undefined
+          ? undefined
+          : `Link diterima. Tag: ${tag}. Sedang mencoba mendownload video...`,
+      );
 
       const controller = new AbortController();
       // Registered before the Stop button exists, so a very fast tap cannot fall
@@ -233,7 +241,7 @@ export class VideoMessageProcessor {
         acceptedMessage,
         items,
         userId,
-        batch: { convertToHeight, forceNoProxy, signal: controller.signal, jobId },
+        batch: { convertToHeight, forceNoProxy, signal: controller.signal, jobId, tag },
       });
       pending.prefetch = prefetch;
 
@@ -244,6 +252,7 @@ export class VideoMessageProcessor {
         forceNoProxy,
         signal: controller.signal,
         jobId,
+        tag,
       }).catch(async (error) => {
         console.error(`Batch failed for status message ${acceptedMessage.messageId}:`, error);
 
@@ -583,7 +592,10 @@ export class VideoMessageProcessor {
           slot.workspace = await this.workspaceManager.create(userId, { reuseDir: slot.resumable?.resumeDir });
 
           if (jobId !== undefined) {
-            slot.itemId = this.db?.addItem(jobId, slot.item.url, { noProxy: slot.item.noProxy });
+            slot.itemId = this.db?.addItem(jobId, slot.item.url, {
+              noProxy: slot.item.noProxy,
+              tag: batch.tag,
+            });
 
             if (slot.itemId !== undefined) {
               this.db?.setItemResumeDir(slot.itemId, slot.workspace.dirPath);

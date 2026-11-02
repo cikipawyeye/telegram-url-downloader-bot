@@ -246,8 +246,8 @@ async function checkDownloadFlow(): Promise<void> {
 
   const db = new BotDatabase(`${TMP_DIR}/bot.db`);
   check(
-    Number(db.db.prepare('PRAGMA user_version').get()!.user_version) === 3,
-    'the job_items migrations (no_proxy, resume_dir) should have been applied',
+    Number(db.db.prepare('PRAGMA user_version').get()!.user_version) === 4,
+    'the job_items migrations (no_proxy, resume_dir, tag) should have been applied',
   );
 
   const downloads: CapturedDownload[] = [];

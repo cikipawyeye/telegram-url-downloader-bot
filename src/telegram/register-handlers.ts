@@ -4,12 +4,25 @@ import { TelegramNotifier } from './notifier.js';
 import { videoSourceFromMessage } from './telegram-media.js';
 import type { AudioMessageProcessor } from '../audio/process-audio-reply.js';
 import type { VideoMessageProcessor } from '../video/process-message.js';
+import {
+  buildInvalidTagMessage,
+  buildTagCleared,
+  buildTagConfirmation,
+  buildTagHistory,
+  buildTagList,
+  buildTagOverview,
+  buildTagUsage,
+  isTagClearCommand,
+  normalizeTag,
+} from '../tags/tag.js';
 
 export const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: 'start', description: 'Mulai dan lihat petunjuk singkat' },
   { command: 'help', description: 'Cara menggunakan bot' },
   { command: 'convert', description: 'Unduh & ubah ukuran video ke resolusi tertentu' },
   { command: 'audio', description: 'Ambil audio dari video yang dikirim bot (reply video)' },
+  { command: 'tag', description: 'Beri tag untuk unduhan berikutnya' },
+  { command: 'tags', description: 'Lihat daftar tag & riwayat unduhan per tag' },
   { command: 'noproxy', description: 'Unduh link tanpa proxy (koneksi langsung)' },
 ];
 
@@ -25,6 +38,11 @@ const HELP_TEXT = [
   'Untuk mengubah ukuran video, gunakan /convert lalu pilih resolusi yang diinginkan (1080p, 720p, 480p, atau 240p), lalu kirimkan link videonya.',
   '',
   'Untuk mengambil audionya saja: balas (reply) pesan video yang dikirim bot dengan /audio. Bot akan mengambil ulang videonya dari Telegram lalu mengirim audionya sebagai MP3.',
+  '',
+  'Untuk menandai unduhan: ketik /tag <nama> (mis. /tag film), lalu kirim link videonya. Tag dipakai untuk pesan link berikutnya saja.',
+  '- /tags untuk melihat daftar tag dan jumlah unduhannya',
+  '- /tags <nama> untuk melihat riwayat unduhan dengan tag tersebut',
+  '- /tag off untuk membatalkan tag aktif',
   '',
   'Kalau link gagal gara-gara proxinya, lewati proxy untuk link tersebut:',
   '- tulis penanda noproxy di pesan, mis. "noproxy <link>" atau "tanpa proxy <link>"',
@@ -77,6 +95,7 @@ export function registerBotHandlers(
         '',
         'Gunakan /convert untuk mengubah ukuran video ke resolusi tertentu.',
         'Balas pesan video dengan /audio untuk mengambil audionya saja.',
+        'Gunakan /tag <nama> untuk menandai unduhan berikutnya, lalu /tags untuk melihat riwayatnya.',
         'Gunakan /noproxy untuk mengunduh link tanpa melewati proxy.',
         '',
         'Ketik /help untuk instruksi lengkap.',
@@ -192,13 +211,15 @@ export function registerBotHandlers(
   });
 
   // Shared by plain messages and /noproxy: records the user/chat, consumes a
-  // pending /convert selection and hands the links over to the processor.
+  // pending /convert selection and a pending /tag, and hands the links over to
+  // the processor.
   const handleVideoMessage = async (ctx: Context, text: string, noProxy = false): Promise<void> => {
     db.touchUser(ctx.from ?? {});
     db.touchChat(ctx.chat ?? {});
 
     const chatId = ctx.chat?.id;
     const pending = chatId !== undefined ? db.getPendingConversion(chatId) : undefined;
+    const pendingTag = chatId !== undefined ? db.getPendingTag(chatId) : undefined;
     const hasUrl = URL_PATTERN.test(text);
 
     if (pending && hasUrl && chatId !== undefined) {
@@ -217,12 +238,19 @@ export function registerBotHandlers(
       }
     }
 
+    // The tag is one-shot: it labels this message only, so a forgotten /tag
+    // cannot keep tagging downloads hours later.
+    if (pendingTag !== undefined && hasUrl && chatId !== undefined) {
+      db.deletePendingTag(chatId);
+    }
+
     await videoMessageProcessor.process({
       notifier: new TelegramNotifier(ctx, bot),
       text,
       userId: String(ctx.from?.id ?? 'unknown'),
       convertToHeight: pending?.height,
       noProxy,
+      tag: pendingTag,
     });
   };
 
@@ -230,6 +258,72 @@ export function registerBotHandlers(
   // Without arguments the processor replies with a usage hint.
   bot.command('noproxy', async (ctx) => {
     await handleVideoMessage(ctx, ctx.match, true);
+  });
+
+  // /tag sets the label of the next link message; /tags lists tags and their
+  // history. grammy matches command names exactly, so /tags never falls into
+  // /tag (and the generic text handler below never sees either of them).
+  bot.command('tag', async (ctx) => {
+    db.touchUser(ctx.from ?? {});
+    db.touchChat(ctx.chat ?? {});
+
+    const chatId = ctx.chat?.id;
+
+    if (chatId === undefined) {
+      await ctx.reply(buildTagUsage());
+      return;
+    }
+
+    const raw = ctx.match.trim();
+
+    if (raw.length === 0) {
+      await ctx.reply(buildTagOverview(db.getPendingTag(chatId), db.listTags(chatId, 10)));
+      return;
+    }
+
+    if (isTagClearCommand(raw)) {
+      db.deletePendingTag(chatId);
+      await ctx.reply(buildTagCleared());
+      return;
+    }
+
+    const tag = normalizeTag(raw);
+
+    if (tag === undefined) {
+      await ctx.reply(buildInvalidTagMessage(raw));
+      return;
+    }
+
+    db.setPendingTag(chatId, tag);
+    await ctx.reply(buildTagConfirmation(tag));
+  });
+
+  bot.command('tags', async (ctx) => {
+    db.touchUser(ctx.from ?? {});
+    db.touchChat(ctx.chat ?? {});
+
+    const chatId = ctx.chat?.id;
+
+    if (chatId === undefined) {
+      await ctx.reply(buildTagUsage());
+      return;
+    }
+
+    const raw = ctx.match.trim();
+
+    if (raw.length === 0) {
+      await ctx.reply(buildTagList(db.listTags(chatId)));
+      return;
+    }
+
+    const tag = normalizeTag(raw);
+
+    if (tag === undefined) {
+      await ctx.reply(buildInvalidTagMessage(raw));
+      return;
+    }
+
+    await ctx.reply(buildTagHistory(tag, db.listItemsByTag(chatId, tag)));
   });
 
   bot.on('message:text', async (ctx) => {
