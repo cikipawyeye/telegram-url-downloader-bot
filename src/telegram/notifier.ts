@@ -138,10 +138,15 @@ export class TelegramNotifier {
     }, waitMs);
   }
 
-  async sendScreenshots(screenshots: VideoScreenshot[]): Promise<void> {
-    const media = screenshots.map((screenshot) => ({
+  /**
+   * Screenshots are sent as one album; `caption` (the tag line) goes on the
+   * first photo because Telegram only shows the first item's caption.
+   */
+  async sendScreenshots(screenshots: VideoScreenshot[], caption?: string): Promise<void> {
+    const media = screenshots.map((screenshot, index) => ({
       type: 'photo' as const,
       media: new InputFile(screenshot.filePath, screenshot.fileName),
+      ...(index === 0 && caption !== undefined ? { caption } : {}),
     }));
 
     await this.bot.api.sendMediaGroup(this.getChatId(), media);

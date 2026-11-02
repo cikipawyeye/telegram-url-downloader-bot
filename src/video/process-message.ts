@@ -13,6 +13,7 @@ import { buildPixelAspectFilter } from './screenshots.js';
 import type { VideoScreenshotGenerator } from './screenshots.js';
 import type { VideoSplitter } from './splitter.js';
 import type { VideoConverter } from './converter.js';
+import { appendTagToCaption, buildTagCaptionLine } from '../tags/tag.js';
 
 export type ProcessVideoMessageRequest = {
   notifier: TelegramNotifier;
@@ -301,7 +302,7 @@ export class VideoMessageProcessor {
     notifier: TelegramNotifier,
     acceptedMessage: StatusMessage,
     prefetch: BatchPrefetch,
-    { convertToHeight, signal, jobId }: BatchOptions,
+    { convertToHeight, signal, jobId, tag }: BatchOptions,
   ): Promise<void> {
     prefetch.deliveryStarted = true;
 
@@ -393,7 +394,7 @@ export class VideoMessageProcessor {
       }
 
       try {
-        await this.processDownloadedVideo(notifier, acceptedMessage, workspace.dirPath, video, convertToHeight, signal);
+        await this.processDownloadedVideo(notifier, acceptedMessage, workspace.dirPath, video, convertToHeight, signal, tag);
         completed += 1;
         slot.state = 'delivered';
         if (slot.itemId !== undefined) {
@@ -737,6 +738,7 @@ export class VideoMessageProcessor {
     initialVideo: Awaited<ReturnType<VideoDownloader['download']>>,
     convertToHeight?: number,
     signal?: AbortSignal,
+    tag?: string,
   ): Promise<void> {
     let video = initialVideo;
     if (convertToHeight !== undefined) {
@@ -842,7 +844,7 @@ export class VideoMessageProcessor {
           await notifier.sendVideoWithScreenshots(screenshots, {
             filePath: segment.filePath,
             fileName: buildDeliveryFileName(segment.filePath, video.title),
-            caption: truncateCaption(video.title),
+            caption: appendTagToCaption(truncateCaption(video.title), tag),
             width: segment.width,
             height: segment.height,
           });
@@ -851,7 +853,12 @@ export class VideoMessageProcessor {
 
         if (screenshots.length > 0) {
           await notifier.updateStatus(acceptedMessage, 'Screenshot selesai. Sedang mengirim screenshot ke Telegram...');
-          await notifier.sendScreenshots(screenshots);
+          // The tag labels the screenshot album too; without a tag the album
+          // keeps its usual caption-less look.
+          await notifier.sendScreenshots(
+            screenshots,
+            tag === undefined ? undefined : buildTagCaptionLine(tag),
+          );
         }
         for (const segment of segments) {
           await notifier.updateStatus(
@@ -866,8 +873,8 @@ export class VideoMessageProcessor {
               ? buildDeliveryPartFileName(segment.filePath, video.title, segment.index, segment.total)
               : buildDeliveryFileName(segment.filePath, video.title),
             caption: segments.length > 1
-              ? buildPartCaption(video.title, segment.index, segment.total)
-              : truncateCaption(video.title),
+              ? appendTagToCaption(buildPartCaption(video.title, segment.index, segment.total), tag)
+              : appendTagToCaption(truncateCaption(video.title), tag),
             thumbnail,
             width: segment.width,
             height: segment.height,

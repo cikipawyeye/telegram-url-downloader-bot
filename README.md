@@ -18,7 +18,7 @@ Bot ini menerima URL dari user, mencoba mengunduh videonya dengan `yt-dlp`, lalu
 - auto cleanup file sementara
 - auto split video yang melebihi batas upload menjadi beberapa part
 - menu `/convert` untuk mengubah ukuran video ke resolusi 1080p / 720p / 480p / 240p (kompatibel streaming di Telegram)
-- tag/label unduhan: `/tag <nama>` menandai unduhan berikutnya, `/tags` melihat daftar tag beserta jumlahnya, dan `/tags <nama>` melihat riwayat unduhan per tag (tersimpan di SQLite)
+- tag/label unduhan: `/tag <nama>` menandai unduhan berikutnya, `/tags` melihat daftar tag beserta jumlahnya, dan `/tags <nama>` melihat riwayat unduhan per tag (tersimpan di SQLite); tag juga tampil sebagai `#tag` di caption video dan screenshot yang dikirim
 - screenshot + video dikirim dalam satu album/media group (bisa dimatikan dengan `SEND_VIDEO_IN_ALBUM=false`)
 - health check endpoint
 
@@ -164,7 +164,9 @@ Detail teknis:
 - Tag disimpan per file di kolom `job_items.tag`, jadi ekspansi album (Bunkr/magnet) menandai semua file hasil ekspansi dengan tag yang sama.
 - Riwayat dibatasi per chat: di grup, semua anggota melihat riwayat chat tersebut; di private chat, riwayat milik chat itu.
 - Riwayat hanya berisi unduhan yang sempat dibuatkan item (kolom `job_items`); link yang gagal total sebelum unduhan dimulai tidak tercatat.
-- Tag tidak mengubah caption video yang dikirim; pesan status "Link diterima" menampilkan tag yang aktif.
+- Tag ditampilkan di hasil kiriman: caption video (dan setiap part kalau video dipecah) diberi baris tambahan `#tag`, dan album screenshot juga memakai caption `#tag`. Tanpa tag, caption tetap seperti biasa (hanya judul video).
+- Telegram mengakhiri hashtag pada karakter `-`, jadi `#film-korea` hanya bagian `film` yang otomatis jadi link pencarian. Teks tag tetap ditampilkan lengkap agar sama dengan nilai di `/tags`.
+- Pesan status "Link diterima" juga menampilkan tag yang aktif.
 
 ## Google Drive dengan `gdown`
 Link Google Drive (`https://drive.google.com/file/d/.../view`, `.../open?id=...`, `.../uc?id=...`, `https://drive.usercontent.google.com/download?id=...`) otomatis diunduh memakai binary `gdown` **jika binary tersebut tersedia di PATH**; kalau tidak ada, bot tetap mencoba lewat `yt-dlp` seperti biasa.

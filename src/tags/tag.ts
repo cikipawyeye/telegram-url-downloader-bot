@@ -74,6 +74,26 @@ export function buildTagCleared(): string {
   return 'Tag aktif dihapus. Unduhan berikutnya tidak akan diberi tag.';
 }
 
+/**
+ * Caption line shown on the delivered video/screenshots.
+ *
+ * Telegram ends a hashtag at `-`, so `#film-korea` only links the `film` part.
+ * The full normalized tag is kept anyway: it matches the value in `/tags`, and
+ * Telegram still makes the first part searchable.
+ */
+export function buildTagCaptionLine(tag: string): string {
+  return `#${tag}`;
+}
+
+/** Append the tag line under a video caption (title, part label, ...). */
+export function appendTagToCaption(caption: string, tag?: string): string {
+  if (tag === undefined) {
+    return caption;
+  }
+
+  return truncateCaption(`${caption.trimEnd()}\n\n${buildTagCaptionLine(tag)}`);
+}
+
 export function buildInvalidTagMessage(raw: string): string {
   return [
     `Tag "${truncateCaption(raw.trim(), 40)}" tidak valid.`,

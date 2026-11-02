@@ -145,9 +145,12 @@ function checkDatabase(): void {
   db.close();
 }
 
-function buildNotifier(chatId: number) {
+function buildNotifier(chatId: number, options: { combineWithVideo?: boolean } = {}) {
   const statuses: string[] = [];
   const accepted: string[] = [];
+  const videoCaptions: string[] = [];
+  const albumCaptions: string[] = [];
+  const screenshotCaptions: Array<string | undefined> = [];
   const notifier = {
     chatId,
     async sendAccepted(text = 'Link diterima. Sedang mencoba mendownload video...'): Promise<StatusMessage> {
@@ -164,20 +167,38 @@ function buildNotifier(chatId: number) {
     },
     async updateProgress(): Promise<void> {},
     canCombineScreenshotsWithVideo(): boolean {
-      return false;
+      return options.combineWithVideo === true;
     },
     async withMediaSendQueue<T>(task: () => Promise<T>): Promise<T> {
       return await task();
     },
-    async sendScreenshots(): Promise<void> {},
-    async sendVideoWithScreenshots(): Promise<void> {},
-    async sendVideo(): Promise<void> {},
+    async sendScreenshots(_screenshots: unknown, caption?: string): Promise<void> {
+      screenshotCaptions.push(caption);
+    },
+    async sendVideoWithScreenshots(_screenshots: unknown, video: { caption: string }): Promise<void> {
+      albumCaptions.push(video.caption);
+    },
+    async sendVideo(video: { caption: string }): Promise<void> {
+      videoCaptions.push(video.caption);
+    },
   };
 
-  return { notifier: notifier as unknown as TelegramNotifier, statuses, accepted };
+  return {
+    notifier: notifier as unknown as TelegramNotifier,
+    statuses,
+    accepted,
+    videoCaptions,
+    albumCaptions,
+    screenshotCaptions,
+  };
 }
 
-function buildProcessor(db: BotDatabase): VideoMessageProcessor {
+function buildProcessor(
+  db: BotDatabase,
+  options: { screenshotCount?: number; sendVideoInAlbum?: boolean } = {},
+): VideoMessageProcessor {
+  const screenshotCount = options.screenshotCount ?? 0;
+
   return new VideoMessageProcessor({
     maxFileSizeBytes: 2 * 1024 * 1024,
     videoDownloader: {
@@ -197,7 +218,10 @@ function buildProcessor(db: BotDatabase): VideoMessageProcessor {
     } as unknown as VideoDownloader,
     videoScreenshotGenerator: {
       async generate() {
-        return [];
+        return Array.from({ length: screenshotCount }, (_unused, index) => ({
+          filePath: `/tmp/fake-screenshot-${index + 1}.jpg`,
+          fileName: `screenshot-${index + 1}.jpg`,
+        }));
       },
       async generateThumbnail() {
         return undefined;
@@ -222,8 +246,8 @@ function buildProcessor(db: BotDatabase): VideoMessageProcessor {
       },
       async remove() {},
     } as unknown as WorkspaceManager,
-    screenshotCount: 0,
-    sendVideoInAlbum: false,
+    screenshotCount,
+    sendVideoInAlbum: options.sendVideoInAlbum === true,
     reencodeAnamorphic: false,
     db,
   });
@@ -247,11 +271,12 @@ async function waitFor<T>(read: () => T | undefined, label: string, timeoutMs = 
 
 /**
  * The tag must reach every job item of the message (a bulk message creates one
- * item per link) and must not leak into the next message.
+ * item per link), must show up on the delivered captions, and must not leak into
+ * the next message.
  */
 async function checkProcessorTag(): Promise<void> {
   const db = new BotDatabase(`${TMP_DIR}/processor.db`);
-  const processor = buildProcessor(db);
+  const processor = buildProcessor(db, { screenshotCount: 1 });
 
   const tagged = buildNotifier(55);
   await processor.process({
@@ -283,6 +308,16 @@ async function checkProcessorTag(): Promise<void> {
     `the accepted status must mention the tag: ${JSON.stringify(tagged.accepted)}`,
   );
 
+  const taggedVideoCaption = await waitFor(() => tagged.videoCaptions[0], 'tagged video caption');
+  check(
+    taggedVideoCaption === 'Video OK\n\n#film',
+    `the video caption must show the tag: ${JSON.stringify(tagged.videoCaptions)}`,
+  );
+  check(
+    tagged.screenshotCaptions[0] === '#film',
+    `the screenshot album must show the tag: ${JSON.stringify(tagged.screenshotCaptions)}`,
+  );
+
   const untagged = buildNotifier(56);
   await processor.process({
     notifier: untagged.notifier,
@@ -309,6 +344,35 @@ async function checkProcessorTag(): Promise<void> {
   check(
     untagged.accepted[0]?.includes('Tag:') !== true,
     `an untagged message must not mention a tag: ${JSON.stringify(untagged.accepted)}`,
+  );
+  check(
+    untagged.videoCaptions[0] === 'Video OK',
+    `an untagged video caption must stay unchanged: ${JSON.stringify(untagged.videoCaptions)}`,
+  );
+  check(
+    untagged.screenshotCaptions[0] === undefined,
+    `an untagged screenshot album must stay caption-less: ${JSON.stringify(untagged.screenshotCaptions)}`,
+  );
+
+  // Album mode (video + screenshots in one media group): the tag lives in the
+  // album caption, which is the video's caption because it is the first item.
+  const albumProcessor = buildProcessor(db, { screenshotCount: 1, sendVideoInAlbum: true });
+  const album = buildNotifier(57, { combineWithVideo: true });
+  await albumProcessor.process({
+    notifier: album.notifier,
+    text: 'https://example.com/d',
+    userId: '1',
+    tag: 'musik',
+  });
+
+  const albumCaption = await waitFor(() => album.albumCaptions[0], 'album caption');
+  check(
+    albumCaption === 'Video OK\n\n#musik',
+    `the album caption must show the tag: ${JSON.stringify(album.albumCaptions)}`,
+  );
+  check(
+    album.screenshotCaptions.length === 0,
+    'album mode must not send a separate screenshot album',
   );
 
   db.close();
