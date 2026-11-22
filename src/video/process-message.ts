@@ -108,7 +108,7 @@ export class VideoMessageProcessor {
   private readonly diskGuard?: DiskSpaceGuard;
   private readonly diskWaitAttempts: number;
   private readonly diskWaitIntervalMs: number;
-  private readonly pendingCancellations = new Map<number, PendingBatch>();
+  private readonly pendingCancellations = new Map<string, PendingBatch>();
 
   constructor(options: {
     maxFileSizeBytes: number;
@@ -152,15 +152,46 @@ export class VideoMessageProcessor {
     this.db = options.db;
   }
 
-  cancelDownload(statusMessageId: number): boolean {
-    const pending = this.pendingCancellations.get(statusMessageId);
+  private cancellationKey(chatId: number, statusMessageId: number): string {
+    return `${chatId}:${statusMessageId}`;
+  }
+
+  /**
+   * Resolve the in-memory entry for a Stop tap. The handler passes both ids
+   * (Telegram message ids are per-chat). The single-argument form is kept for
+   * older callers and tests.
+   */
+  private resolveCancellationKey(chatId: number, statusMessageId?: number): string | undefined {
+    if (statusMessageId !== undefined) {
+      const key = this.cancellationKey(chatId, statusMessageId);
+      return this.pendingCancellations.has(key) ? key : undefined;
+    }
+
+    const suffix = `:${chatId}`;
+    for (const key of this.pendingCancellations.keys()) {
+      if (key.endsWith(suffix)) {
+        return key;
+      }
+    }
+
+    return undefined;
+  }
+
+  cancelDownload(chatId: number, statusMessageId?: number): boolean {
+    const key = this.resolveCancellationKey(chatId, statusMessageId);
+
+    if (key === undefined) {
+      return false;
+    }
+
+    const pending = this.pendingCancellations.get(key);
 
     if (!pending || pending.controller.signal.aborted) {
       return false;
     }
 
     pending.controller.abort();
-    this.pendingCancellations.delete(statusMessageId);
+    this.pendingCancellations.delete(key);
 
     if (pending.jobId !== undefined) {
       this.db?.cancelItems(pending.jobId);
@@ -198,7 +229,12 @@ export class VideoMessageProcessor {
       return;
     }
 
-    const maxBulkUrls = parseInt(process.env.MAX_BULK_URLS ?? '20', 10);
+    // parseInt('abc') is NaN, which would make `items.length > NaN` false and
+    // silently disable the limit; validate instead.
+    const configuredMaxBulkUrls = Number(process.env.MAX_BULK_URLS ?? 20);
+    const maxBulkUrls = Number.isFinite(configuredMaxBulkUrls) && configuredMaxBulkUrls >= 1
+      ? Math.floor(configuredMaxBulkUrls)
+      : 20;
     if (items.length > maxBulkUrls) {
       await notifier.sendBatchLimit(maxBulkUrls);
       return;
@@ -212,6 +248,7 @@ export class VideoMessageProcessor {
       );
 
       const controller = new AbortController();
+      const cancellationKey = this.cancellationKey(notifier.chatId, acceptedMessage.messageId);
       // Registered before the Stop button exists, so a very fast tap cannot fall
       // through to "Tidak ada proses yang sedang berjalan".
       const pending: PendingBatch = {
@@ -219,14 +256,25 @@ export class VideoMessageProcessor {
         notifier,
         statusMessage: acceptedMessage,
       };
-      this.pendingCancellations.set(acceptedMessage.messageId, pending);
+      this.pendingCancellations.set(cancellationKey, pending);
 
-      const jobId = this.db?.createJob({
-        chatId: notifier.chatId,
-        userId: Number(userId) || undefined,
-        statusMessageId: acceptedMessage.messageId,
-        convertHeight: convertToHeight,
-      });
+      let jobId: number | undefined;
+      try {
+        jobId = this.db?.createJob({
+          chatId: notifier.chatId,
+          userId: Number(userId) || undefined,
+          statusMessageId: acceptedMessage.messageId,
+          convertHeight: convertToHeight,
+        });
+      } catch (error) {
+        this.pendingCancellations.delete(cancellationKey);
+        console.error('Failed to create the job row:', error);
+        await notifier.failStatus(
+          acceptedMessage,
+          'Gagal menyiapkan job unduhan. Coba kirim ulang link sebentar lagi.',
+        ).catch(() => undefined);
+        throw error;
+      }
       pending.jobId = jobId;
 
       await notifier.addDownloadStopButton(
@@ -257,7 +305,7 @@ export class VideoMessageProcessor {
       }).catch(async (error) => {
         console.error(`Batch failed for status message ${acceptedMessage.messageId}:`, error);
 
-        this.pendingCancellations.delete(acceptedMessage.messageId);
+        this.pendingCancellations.delete(cancellationKey);
         if (jobId !== undefined) {
           this.db?.cancelItems(jobId);
           this.db?.finishJob(jobId, 'failed');
@@ -266,7 +314,9 @@ export class VideoMessageProcessor {
         await prefetch.discardUndelivered().catch(() => undefined);
 
         const reason = summarizeErrorMessage(error);
-        await notifier.updateStatus(
+        // Clear the stop button even when the status update itself fails;
+        // otherwise the user keeps an inert button and a stale "Link diterima".
+        await notifier.failStatus(
           acceptedMessage,
           `Proses berhenti karena error. Kirim ulang link untuk melanjutkan.\n${reason}`,
         ).catch(() => undefined);
@@ -306,10 +356,30 @@ export class VideoMessageProcessor {
   ): Promise<void> {
     prefetch.deliveryStarted = true;
 
-    const { items, expansionFailures } = await prefetch.ready;
+    const cancellationKey = this.cancellationKey(notifier.chatId, acceptedMessage.messageId);
+    let ready: Awaited<BatchPrefetch['ready']>;
+
+    try {
+      ready = await prefetch.ready;
+    } catch (error) {
+      if (error instanceof DownloadCancelledError) {
+        this.pendingCancellations.delete(cancellationKey);
+        await prefetch.discardUndelivered().catch(() => undefined);
+        if (jobId !== undefined) {
+          this.db?.cancelItems(jobId);
+          this.db?.finishJob(jobId, 'cancelled');
+        }
+        await notifier.confirmStopped(acceptedMessage);
+        return;
+      }
+
+      throw error;
+    }
+
+    const { items, expansionFailures } = ready;
 
     if (items.length === 0) {
-      this.pendingCancellations.delete(acceptedMessage.messageId);
+      this.pendingCancellations.delete(cancellationKey);
       if (jobId !== undefined) {
         this.db?.setJobTotalUrls(jobId, 0);
         this.db?.finishJob(jobId, 'failed');
@@ -319,7 +389,7 @@ export class VideoMessageProcessor {
         : 'Album berhasil dibaca, tetapi tidak berisi video.';
       await notifier.updateStatus(acceptedMessage, message);
       await notifier.removeDownloadStopButton(acceptedMessage);
-      this.pendingCancellations.delete(acceptedMessage.messageId);
+      this.pendingCancellations.delete(cancellationKey);
       return;
     }
 
@@ -340,7 +410,7 @@ export class VideoMessageProcessor {
         slot.state = 'cancelled';
         await prefetch.discardUndelivered();
         await notifier.confirmStopped(acceptedMessage);
-        this.pendingCancellations.delete(acceptedMessage.messageId);
+        this.pendingCancellations.delete(cancellationKey);
         return;
       }
 
@@ -355,6 +425,18 @@ export class VideoMessageProcessor {
 
       await slot.task;
 
+      if (signal.aborted) {
+        slot.state = 'cancelled';
+        await prefetch.discardUndelivered();
+        if (jobId !== undefined) {
+          this.db?.cancelItems(jobId);
+          this.db?.finishJob(jobId, 'cancelled');
+        }
+        await notifier.confirmStopped(acceptedMessage);
+        this.pendingCancellations.delete(cancellationKey);
+        return;
+      }
+
       if (slot.error !== undefined) {
         if (slot.error instanceof DownloadCancelledError) {
           slot.state = 'cancelled';
@@ -364,6 +446,7 @@ export class VideoMessageProcessor {
             this.db?.finishJob(jobId, 'cancelled');
           }
           await notifier.confirmStopped(acceptedMessage);
+          this.pendingCancellations.delete(cancellationKey);
           return;
         }
 
@@ -410,6 +493,7 @@ export class VideoMessageProcessor {
             this.db?.finishJob(jobId, 'cancelled');
           }
           await notifier.confirmStopped(acceptedMessage);
+          this.pendingCancellations.delete(cancellationKey);
           return;
         }
 
@@ -434,8 +518,15 @@ export class VideoMessageProcessor {
       }
     }
 
-    this.pendingCancellations.delete(acceptedMessage.messageId);
+    this.pendingCancellations.delete(cancellationKey);
     await notifier.removeDownloadStopButton(acceptedMessage);
+
+    if (jobId !== undefined) {
+      // The success path used to leave jobs at status='running' forever.
+      const finalStatus = failed.length === 0 || completed > 0 ? 'completed' : 'failed';
+      this.db?.finishJob(jobId, finalStatus);
+    }
+
     if (failed.length === 0) {
       await notifier.deleteStatus(acceptedMessage);
     } else {
@@ -465,7 +556,7 @@ export class VideoMessageProcessor {
     const reporter = new BatchProgressReporter({ notifier, statusMessage: acceptedMessage });
     const slots: PrefetchSlot[] = [];
 
-    const ready = this.expandItems(items, batch.forceNoProxy).then(({ items: expanded, failures }) => {
+    const ready = this.expandItems(items, batch.forceNoProxy, batch.signal).then(({ items: expanded, failures }) => {
       for (const [index, item] of expanded.entries()) {
         // Claim any leftover partial synchronously, before the slot waits for a
         // download slot: the delivery loop needs to know about the resume while
@@ -546,11 +637,16 @@ export class VideoMessageProcessor {
   private async expandItems(
     items: VideoRequestItem[],
     forceNoProxy: boolean,
+    signal: AbortSignal,
   ): Promise<{ items: VideoRequestItem[]; failures: BatchFailure[] }> {
     const expandedItems: VideoRequestItem[] = [];
     const expansionFailures: BatchFailure[] = [];
 
     for (const item of items) {
+      if (signal.aborted) {
+        throw new DownloadCancelledError();
+      }
+
       try {
         const expandedUrls = await this.videoDownloader.expandUrl(item.url, {
           noProxy: item.noProxy || forceNoProxy,
@@ -561,6 +657,11 @@ export class VideoMessageProcessor {
       } catch (error) {
         console.error(`Failed to read bulk URL ${item.url}:`, error);
         expansionFailures.push({ url: item.url, reason: summarizeErrorMessage(error) });
+      }
+
+      // Stop may have arrived while the (unabortable) metadata request ran.
+      if (signal.aborted) {
+        throw new DownloadCancelledError();
       }
     }
 
@@ -712,11 +813,16 @@ export class VideoMessageProcessor {
   /** Abortable sleep used between download retry attempts. */
   private async delay(ms: number, signal?: AbortSignal): Promise<void> {
     await new Promise<void>((resolve, reject) => {
+      let timer: NodeJS.Timeout | undefined;
+
       const onAbort = () => {
-        clearTimeout(timer);
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
         reject(new DownloadCancelledError());
       };
-      const timer = setTimeout(() => {
+
+      timer = setTimeout(() => {
         signal?.removeEventListener('abort', onAbort);
         resolve();
       }, ms);
@@ -740,6 +846,8 @@ export class VideoMessageProcessor {
     signal?: AbortSignal,
     tag?: string,
   ): Promise<void> {
+    throwIfCancelled(signal);
+
     let video = initialVideo;
     if (convertToHeight !== undefined) {
         await notifier.updateStatus(
@@ -759,6 +867,8 @@ export class VideoMessageProcessor {
             void this.reportConversionProgress(notifier, acceptedMessage, convertToHeight, percent);
           },
         });
+
+        throwIfCancelled(signal);
 
         await notifier.updateStatus(
           acceptedMessage,
@@ -782,6 +892,8 @@ export class VideoMessageProcessor {
           signal,
         });
 
+        throwIfCancelled(signal);
+
         await notifier.updateStatus(
           acceptedMessage,
           'Perbaikan dimensi selesai. Sedang membuat screenshot video...',
@@ -793,12 +905,17 @@ export class VideoMessageProcessor {
         );
       }
 
+    throwIfCancelled(signal);
+
     const screenshots = await this.tryGenerateScreenshots({
         acceptedMessage,
         notifier,
         outputDir,
         video,
+        signal,
       });
+
+    throwIfCancelled(signal);
 
     await notifier.updateStatus(
         acceptedMessage,
@@ -812,7 +929,10 @@ export class VideoMessageProcessor {
         notifier,
         outputDir,
         video,
+        signal,
       });
+
+    throwIfCancelled(signal);
 
     await notifier.updateStatus(
         acceptedMessage,
@@ -830,7 +950,11 @@ export class VideoMessageProcessor {
       await this.diskGuard?.assertRoomFor(video.fileSize, 'Ruang disk tidak cukup untuk memecah video');
     }
 
-    const segments = await this.videoSplitter.split(video, outputDir, this.maxFileSizeBytes);
+    throwIfCancelled(signal);
+
+    const segments = await this.videoSplitter.split(video, outputDir, this.maxFileSizeBytes, signal);
+
+    throwIfCancelled(signal);
 
     const shouldCombine =
         this.sendVideoInAlbum &&
@@ -838,9 +962,12 @@ export class VideoMessageProcessor {
         segments.length === 1;
 
     await notifier.withMediaSendQueue(async () => {
+        throwIfCancelled(signal);
+
         if (shouldCombine) {
           const segment = segments[0];
           await notifier.updateStatus(acceptedMessage, 'Screenshot & video siap. Sedang mengirim ke Telegram dalam satu album...');
+          throwIfCancelled(signal);
           await notifier.sendVideoWithScreenshots(screenshots, {
             filePath: segment.filePath,
             fileName: buildDeliveryFileName(segment.filePath, video.title),
@@ -853,6 +980,7 @@ export class VideoMessageProcessor {
 
         if (screenshots.length > 0) {
           await notifier.updateStatus(acceptedMessage, 'Screenshot selesai. Sedang mengirim screenshot ke Telegram...');
+          throwIfCancelled(signal);
           // The tag labels the screenshot album too; without a tag the album
           // keeps its usual caption-less look.
           await notifier.sendScreenshots(
@@ -861,6 +989,7 @@ export class VideoMessageProcessor {
           );
         }
         for (const segment of segments) {
+          throwIfCancelled(signal);
           await notifier.updateStatus(
             acceptedMessage,
             segments.length > 1
@@ -888,6 +1017,7 @@ export class VideoMessageProcessor {
     notifier: TelegramNotifier;
     outputDir: string;
     video: Awaited<ReturnType<VideoDownloader['download']>>;
+    signal?: AbortSignal;
   }) {
     try {
       return await this.videoScreenshotGenerator.generate({
@@ -895,8 +1025,13 @@ export class VideoMessageProcessor {
         outputDir: options.outputDir,
         durationSeconds: options.video.durationSeconds,
         count: this.screenshotCount,
+        signal: options.signal,
       });
     } catch (error) {
+      if (options.signal?.aborted) {
+        throw new DownloadCancelledError();
+      }
+
       console.error('Failed to generate screenshots:', error);
 
       await options.notifier.updateStatus(
@@ -913,14 +1048,20 @@ export class VideoMessageProcessor {
     notifier: TelegramNotifier;
     outputDir: string;
     video: Awaited<ReturnType<VideoDownloader['download']>>;
+    signal?: AbortSignal;
   }): Promise<VideoThumbnail | undefined> {
     try {
       return await this.videoScreenshotGenerator.generateThumbnail({
         videoPath: options.video.filePath,
         outputDir: options.outputDir,
         durationSeconds: options.video.durationSeconds,
+        signal: options.signal,
       });
     } catch (error) {
+      if (options.signal?.aborted) {
+        throw new DownloadCancelledError();
+      }
+
       console.error('Failed to generate thumbnail:', error);
 
       await options.notifier.updateStatus(
@@ -957,5 +1098,15 @@ export class VideoMessageProcessor {
     } catch (error) {
       console.error('Failed to update conversion progress:', error);
     }
+  }
+}
+
+/**
+ * AbortSignal.abort() throws a DOMException by default; the batch loop only
+ * treats `DownloadCancelledError` as a user stop, so normalize it here.
+ */
+function throwIfCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new DownloadCancelledError();
   }
 }

@@ -1,5 +1,5 @@
 import path from 'node:path';
-import type { WorkspaceManager } from '../storage/workspace.js';
+import type { DownloadWorkspace, WorkspaceManager } from '../storage/workspace.js';
 import type { StatusMessage, TelegramNotifier } from '../telegram/notifier.js';
 import type { TelegramMediaDownloader, TelegramVideoSource } from '../telegram/telegram-media.js';
 import { DownloadCancelledError } from '../video/downloader.js';
@@ -24,7 +24,7 @@ export class AudioMessageProcessor {
   private readonly audioExtractor: AudioExtractor;
   private readonly workspaceManager: WorkspaceManager;
   private readonly maxFileSizeBytes: number;
-  private readonly pendingCancellations = new Map<number, AbortController>();
+  private readonly pendingCancellations = new Map<string, AbortController>();
 
   constructor(options: {
     mediaDownloader: TelegramMediaDownloader;
@@ -38,28 +38,63 @@ export class AudioMessageProcessor {
     this.maxFileSizeBytes = options.maxFileSizeBytes;
   }
 
-  cancelDownload(statusMessageId: number): boolean {
-    const controller = this.pendingCancellations.get(statusMessageId);
+  cancelDownload(chatId: number, statusMessageId?: number): boolean {
+    const key = this.resolveCancellationKey(chatId, statusMessageId);
+
+    if (key === undefined) {
+      return false;
+    }
+
+    const controller = this.pendingCancellations.get(key);
 
     if (!controller || controller.signal.aborted) {
       return false;
     }
 
     controller.abort();
-    this.pendingCancellations.delete(statusMessageId);
+    this.pendingCancellations.delete(key);
     return true;
+  }
+
+  private cancellationKey(chatId: number, statusMessageId: number): string {
+    return `${chatId}:${statusMessageId}`;
+  }
+
+  private resolveCancellationKey(chatId: number, statusMessageId?: number): string | undefined {
+    if (statusMessageId !== undefined) {
+      const key = this.cancellationKey(chatId, statusMessageId);
+      return this.pendingCancellations.has(key) ? key : undefined;
+    }
+
+    const suffix = `:${chatId}`;
+    for (const key of this.pendingCancellations.keys()) {
+      if (key.endsWith(suffix)) {
+        return key;
+      }
+    }
+
+    return undefined;
   }
 
   async process({ notifier, media, userId }: ProcessAudioReplyRequest): Promise<void> {
     const acceptedMessage = await notifier.sendAccepted('Video diterima. Sedang menyiapkan ekstraksi audio...');
+    const cancellationKey = this.cancellationKey(notifier.chatId, acceptedMessage.messageId);
     const controller = new AbortController();
-    this.pendingCancellations.set(acceptedMessage.messageId, controller);
+    this.pendingCancellations.set(cancellationKey, controller);
 
     await notifier.addDownloadStopButton(acceptedMessage, `stop:download:${acceptedMessage.messageId}`);
 
-    const workspace = await this.workspaceManager.create(userId);
+    let workspace: DownloadWorkspace | undefined;
 
     try {
+      if (media.fileSize !== undefined && media.fileSize > this.maxFileSizeBytes) {
+        throw new Error(
+          `Video sumber ${formatBytes(media.fileSize)} melebihi batas ${formatBytes(this.maxFileSizeBytes)}.`,
+        );
+      }
+
+      workspace = await this.workspaceManager.create(userId);
+
       await notifier.updateStatus(acceptedMessage, 'Mengambil video dari Telegram...');
 
       const downloaded = await this.mediaDownloader.download(media, {
@@ -70,7 +105,7 @@ export class AudioMessageProcessor {
         },
       });
 
-      const probe = await this.audioExtractor.probe(downloaded.filePath);
+      const probe = await this.audioExtractor.probe(downloaded.filePath, controller.signal);
 
       if (!probe.hasAudioStream) {
         throw new Error('Video ini tidak punya track audio untuk diekstrak.');
@@ -115,11 +150,12 @@ export class AudioMessageProcessor {
       }
 
       console.error(`Failed to extract audio from Telegram file ${media.fileId}:`, error);
-      await notifier.removeDownloadStopButton(acceptedMessage);
-      await notifier.updateStatus(acceptedMessage, `Gagal mengekstrak audio: ${summarizeErrorMessage(error)}`);
+      await notifier.failStatus(acceptedMessage, `Gagal mengekstrak audio: ${summarizeErrorMessage(error)}`);
     } finally {
-      this.pendingCancellations.delete(acceptedMessage.messageId);
-      await this.workspaceManager.remove(workspace);
+      this.pendingCancellations.delete(cancellationKey);
+      if (workspace !== undefined) {
+        await this.workspaceManager.remove(workspace);
+      }
     }
   }
 

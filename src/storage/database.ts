@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 const MIGRATIONS: Array<{ version: number; sql: string }> = [
   {
@@ -111,6 +111,46 @@ const MIGRATIONS: Array<{ version: number; sql: string }> = [
         tag        TEXT NOT NULL,
         created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
       );
+    `,
+  },
+  {
+    version: 5,
+    sql: `
+      -- Telegram message ids are only unique inside a chat, so the old global
+      -- UNIQUE(status_message_id) made two chats collide and blocked the second
+      -- chat from creating a job at all. Rebuild the table with a composite
+      -- key. The migration runner disables foreign keys for this rebuild.
+      CREATE TABLE jobs_v5 (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id           INTEGER NOT NULL,
+        user_id           INTEGER,
+        status_message_id INTEGER NOT NULL,
+        status            TEXT NOT NULL DEFAULT 'running'
+                          CHECK (status IN ('running', 'completed', 'failed', 'cancelled')),
+        convert_height    INTEGER,
+        total_urls        INTEGER NOT NULL DEFAULT 0,
+        done_urls         INTEGER NOT NULL DEFAULT 0,
+        failed_urls       INTEGER NOT NULL DEFAULT 0,
+        cancel_requested  INTEGER NOT NULL DEFAULT 0,
+        created_at        INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+        finished_at       INTEGER,
+        UNIQUE (chat_id, status_message_id)
+      );
+
+      INSERT INTO jobs_v5 (
+        id, chat_id, user_id, status_message_id, status, convert_height,
+        total_urls, done_urls, failed_urls, cancel_requested, created_at, finished_at
+      )
+      SELECT
+        id, chat_id, user_id, status_message_id, status, convert_height,
+        total_urls, done_urls, failed_urls, cancel_requested, created_at, finished_at
+      FROM jobs;
+
+      DROP TABLE jobs;
+      ALTER TABLE jobs_v5 RENAME TO jobs;
+
+      CREATE INDEX IF NOT EXISTS idx_jobs_chat   ON jobs(chat_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status) WHERE status = 'running';
     `,
   },
 ];
@@ -250,12 +290,50 @@ export class BotDatabase {
     ).run(status, jobId, jobId, jobId);
   }
 
-  requestCancelByStatusMessage(statusMessageId: number): boolean {
+  requestCancelByStatusMessage(chatId: number, statusMessageId?: number): boolean {
+    if (statusMessageId === undefined) {
+      // Backwards-compatible call shape (used by older callers/tests): a
+      // message id alone cannot identify a chat, so keep the old behaviour.
+      const result = this.db.prepare(
+        "UPDATE jobs SET cancel_requested = 1 WHERE status_message_id = ? AND status = 'running'",
+      ).run(chatId);
+
+      return result.changes > 0;
+    }
+
     const result = this.db.prepare(
-      "UPDATE jobs SET cancel_requested = 1 WHERE status_message_id = ? AND status = 'running'",
-    ).run(statusMessageId);
+      "UPDATE jobs SET cancel_requested = 1 WHERE chat_id = ? AND status_message_id = ? AND status = 'running'",
+    ).run(chatId, statusMessageId);
 
     return result.changes > 0;
+  }
+
+  /**
+   * Jobs left in `running` by a crash/restart can never finish: the process
+   * that owned them is gone. Mark them (and their pending items) as failed so
+   * the UI no longer shows them as active and a resend can resume the partial
+   * files (`takeResumableItem` only considers failed/cancelled items).
+   */
+  recoverInterruptedJobs(): number {
+    const items = this.db.prepare(
+      `UPDATE job_items
+          SET status = 'failed',
+              error = COALESCE(error, 'Bot berhenti sebelum item selesai.'),
+              finished_at = strftime('%s', 'now')
+        WHERE status = 'pending'
+          AND job_id IN (SELECT id FROM jobs WHERE status = 'running')`,
+    ).run();
+
+    this.db.prepare(
+      `UPDATE jobs
+          SET status = 'failed',
+              finished_at = strftime('%s', 'now'),
+              done_urls = (SELECT COUNT(*) FROM job_items WHERE job_id = jobs.id AND status = 'done'),
+              failed_urls = (SELECT COUNT(*) FROM job_items WHERE job_id = jobs.id AND status = 'failed')
+        WHERE status = 'running'`,
+    ).run();
+
+    return Number(items.changes);
   }
 
   isCancelRequested(jobId: number): boolean {
@@ -405,6 +483,13 @@ export class BotDatabase {
         continue;
       }
 
+      // Rebuilding a parent table (jobs) requires foreign keys to be off;
+      // PRAGMA foreign_keys cannot be changed inside a transaction.
+      const needsForeignKeysOff = migration.version === 5;
+      if (needsForeignKeysOff) {
+        this.db.exec('PRAGMA foreign_keys = OFF;');
+      }
+
       this.db.exec('BEGIN;');
       try {
         this.db.exec(migration.sql);
@@ -413,6 +498,10 @@ export class BotDatabase {
       } catch (error) {
         this.db.exec('ROLLBACK;');
         throw error;
+      } finally {
+        if (needsForeignKeysOff) {
+          this.db.exec('PRAGMA foreign_keys = ON;');
+        }
       }
     }
   }

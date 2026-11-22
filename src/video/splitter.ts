@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import { DownloadCancelledError } from './downloader.js';
 import type { DownloadedVideo } from './utils.js';
 
 export type VideoSegment = {
@@ -21,7 +22,16 @@ export class VideoSplitter {
     this.commandTimeoutMs = options.commandTimeoutMs;
   }
 
-  async split(video: DownloadedVideo, outputDir: string, maxFileSizeBytes: number): Promise<VideoSegment[]> {
+  async split(
+    video: DownloadedVideo,
+    outputDir: string,
+    maxFileSizeBytes: number,
+    signal?: AbortSignal,
+  ): Promise<VideoSegment[]> {
+    if (signal?.aborted) {
+      throw new DownloadCancelledError();
+    }
+
     if (video.fileSize <= maxFileSizeBytes) {
       return [{
         filePath: video.filePath,
@@ -36,34 +46,46 @@ export class VideoSplitter {
     const durationSeconds =
       video.durationSeconds !== undefined && video.durationSeconds > 0
         ? video.durationSeconds
-        : await this.probeDuration(video.filePath);
+        : await this.probeDuration(video.filePath, signal);
 
     const targetSegmentSize = Math.max(1, Math.floor(maxFileSizeBytes * this.targetSizeRatio));
     let segmentCount = Math.max(2, Math.ceil(video.fileSize / targetSegmentSize));
 
-    for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
-      const segments = await this.splitWithSegmentCount({
-        durationSeconds,
-        maxFileSizeBytes,
-        outputDir,
-        segmentCount,
-        videoPath: video.filePath,
-      });
+    try {
+      for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
+        const segments = await this.splitWithSegmentCount({
+          durationSeconds,
+          maxFileSizeBytes,
+          outputDir,
+          segmentCount,
+          videoPath: video.filePath,
+          signal,
+        });
 
-      if (segments.every((segment) => segment.fileSize <= maxFileSizeBytes)) {
-        return segments.map((segment, index) => ({
-          ...segment,
-          index: index + 1,
-          total: segments.length,
-          // Stream-copied parts keep the source dimensions.
-          width: video.width,
-          height: video.height,
-        }));
+        if (segments.every((segment) => segment.fileSize <= maxFileSizeBytes)) {
+          // Earlier oversized attempts leave their own segments-* dirs behind;
+          // keep only the parts we are about to deliver.
+          await this.removeOtherSegmentDirs(outputDir, segments[0]?.filePath);
+          return segments.map((segment, index) => ({
+            ...segment,
+            index: index + 1,
+            total: segments.length,
+            // Stream-copied parts keep the source dimensions.
+            width: video.width,
+            height: video.height,
+          }));
+        }
+
+        segmentCount += 1;
       }
-
-      segmentCount += 1;
+    } catch (error) {
+      // Failed/aborted split: the part files are unusable. Leaving them behind
+      // makes every retry start with a nearly full disk.
+      await this.removeSegmentDirs(outputDir);
+      throw error;
     }
 
+    await this.removeSegmentDirs(outputDir);
     throw new Error('Video terlalu besar untuk dipecah menjadi bagian yang aman dikirim ke Telegram.');
   }
 
@@ -73,6 +95,7 @@ export class VideoSplitter {
     outputDir: string;
     segmentCount: number;
     videoPath: string;
+    signal?: AbortSignal;
   }): Promise<VideoSegment[]> {
     const segmentsDir = path.join(options.outputDir, `segments-${String(options.segmentCount).padStart(3, '0')}`);
     await fsp.rm(segmentsDir, { recursive: true, force: true });
@@ -87,8 +110,15 @@ export class VideoSplitter {
       'error',
       '-i',
       options.videoPath,
+      // Video + first audio only. Copying every stream (the old `-map 0`)
+      // fails for MKV sources whose ASS/PGS subtitles have no MP4 codec tag,
+      // leaving a 0-byte first part.
       '-map',
-      '0',
+      '0:v:0',
+      '-map',
+      '0:a:0?',
+      '-sn',
+      '-dn',
       '-c',
       'copy',
       '-f',
@@ -102,7 +132,7 @@ export class VideoSplitter {
       '-reset_timestamps',
       '1',
       outputPattern,
-    ]);
+    ], options.signal);
 
     const files = (await fsp.readdir(segmentsDir))
       .filter((file) => file.endsWith('.mp4'))
@@ -143,7 +173,7 @@ export class VideoSplitter {
     return segments;
   }
 
-  private async probeDuration(videoPath: string): Promise<number> {
+  private async probeDuration(videoPath: string, signal?: AbortSignal): Promise<number> {
     const output = await this.runCommand('ffprobe', [
       '-v',
       'error',
@@ -152,7 +182,7 @@ export class VideoSplitter {
       '-of',
       'default=noprint_wrappers=1:nokey=1',
       videoPath,
-    ]);
+    ], signal);
 
     const durationSeconds = Number(output.trim());
 
@@ -163,7 +193,34 @@ export class VideoSplitter {
     return durationSeconds;
   }
 
-  private async runCommand(command: string, args: string[]): Promise<string> {
+  private async removeSegmentDirs(outputDir: string): Promise<void> {
+    const entries = await fsp.readdir(outputDir).catch(() => [] as string[]);
+
+    await Promise.all(
+      entries
+        .filter((entry) => entry.startsWith('segments-'))
+        .map((entry) => fsp.rm(path.join(outputDir, entry), { recursive: true, force: true })),
+    );
+  }
+
+  private async removeOtherSegmentDirs(outputDir: string, keepFilePath: string | undefined): Promise<void> {
+    if (keepFilePath === undefined) {
+      return;
+    }
+
+    const keepDir = path.dirname(keepFilePath);
+    const entries = await fsp.readdir(outputDir).catch(() => [] as string[]);
+
+    await Promise.all(
+      entries
+        .filter((entry) => entry.startsWith('segments-'))
+        .map((entry) => path.join(outputDir, entry))
+        .filter((entryPath) => entryPath !== keepDir)
+        .map((entryPath) => fsp.rm(entryPath, { recursive: true, force: true })),
+    );
+  }
+
+  private async runCommand(command: string, args: string[], signal?: AbortSignal): Promise<string> {
     return await new Promise<string>((resolve, reject) => {
       const child = spawn(command, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -172,16 +229,45 @@ export class VideoSplitter {
       let stdout = '';
       let stderr = '';
       let settled = false;
+      let timer: NodeJS.Timeout | undefined;
 
-      const timer = setTimeout(() => {
+      const cleanup = () => {
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
+        signal?.removeEventListener('abort', onAbort);
+      };
+
+      const onAbort = () => {
         if (settled) {
           return;
         }
 
         settled = true;
+        cleanup();
+        child.kill('SIGKILL');
+        reject(new DownloadCancelledError());
+      };
+
+      timer = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
         child.kill('SIGKILL');
         reject(new Error(`${command} timeout setelah ${Math.round(this.commandTimeoutMs / 1000)} detik.`));
       }, this.commandTimeoutMs);
+
+      if (signal) {
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
 
       child.stdout.on('data', (chunk) => {
         stdout += String(chunk);
@@ -197,7 +283,7 @@ export class VideoSplitter {
         }
 
         settled = true;
-        clearTimeout(timer);
+        cleanup();
         reject(error);
       });
 
@@ -207,7 +293,7 @@ export class VideoSplitter {
         }
 
         settled = true;
-        clearTimeout(timer);
+        cleanup();
 
         if (code === 0) {
           resolve(stdout);

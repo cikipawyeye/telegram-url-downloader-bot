@@ -32,7 +32,7 @@ export class AudioExtractor {
    * without audio fails with a clear message instead of ffmpeg's
    * "Stream map '0:a:0' matches no streams".
    */
-  async probe(videoPath: string): Promise<AudioProbe> {
+  async probe(videoPath: string, signal?: AbortSignal): Promise<AudioProbe> {
     let output: string;
 
     try {
@@ -46,8 +46,12 @@ export class AudioExtractor {
         '-of',
         'json',
         videoPath,
-      ]);
+      ], { signal });
     } catch (error) {
+      if (signal?.aborted) {
+        throw new DownloadCancelledError();
+      }
+
       throw new Error(`Gagal membaca file video. ${formatError(error)}`);
     }
 
@@ -94,7 +98,7 @@ export class AudioExtractor {
     );
 
     const stat = await fsp.stat(outputFilePath);
-    const extractedProbe = await this.probe(outputFilePath);
+    const extractedProbe = await this.probe(outputFilePath, options.signal);
 
     return {
       filePath: outputFilePath,
@@ -116,9 +120,12 @@ export class AudioExtractor {
       let stdout = '';
       let stderr = '';
       let settled = false;
+      let timer: NodeJS.Timeout | undefined;
 
       const cleanup = () => {
-        clearTimeout(timer);
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
         options.signal?.removeEventListener('abort', onAbort);
       };
 
@@ -142,7 +149,7 @@ export class AudioExtractor {
         options.signal.addEventListener('abort', onAbort, { once: true });
       }
 
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         if (settled) {
           return;
         }

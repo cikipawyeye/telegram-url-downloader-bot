@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { hydrateFiles } from '@grammyjs/files';
+import type { NextFunction, Request, Response } from 'express';
 import { Bot, type Context, webhookCallback } from 'grammy';
 import { YtDlp } from 'ytdlp-nodejs';
 import { AudioExtractor } from './audio/extractor.js';
@@ -43,6 +44,10 @@ async function bootstrap(): Promise<void> {
   workspaceManager.startAutoSweep();
 
   const db = new BotDatabase(config.dbPath);
+  const recoveredItems = db.recoverInterruptedJobs();
+  if (recoveredItems > 0) {
+    console.warn(`Recovered ${recoveredItems} download item(s) interrupted by the previous shutdown.`);
+  }
 
   // Shared across every chat: queued batches prefetch their links while another
   // chat (or an earlier message) is still sending, so the limit has to be
@@ -103,8 +108,33 @@ async function bootstrap(): Promise<void> {
 
   const app = createHttpApp(config.downloadDir);
   const webhookPath = `/telegram/webhook/${config.webhookSecret}`;
+  const webhookHandler = webhookCallback(bot, 'express', {
+    // /audio processes a whole file; the grammy default (10s) rejected it and
+    // Express 4 turned the rejection into a process-killing unhandled
+    // rejection. Returning on timeout stops Telegram retries.
+    timeoutMilliseconds: 60_000,
+    onTimeout: 'return',
+    secretToken: config.webhookSecretToken,
+  });
 
-  app.use(webhookPath, webhookCallback(bot, 'express'));
+  app.use(webhookPath, (req, res, next) => {
+    // Express 4 does not catch rejected async handlers, so keep the rejection
+    // inside this route instead of letting it crash the process.
+    void webhookHandler(req, res).catch((error) => {
+      console.error(`Webhook error on ${webhookPath}:`, error);
+      if (!res.headersSent) {
+        res.status(500).json({ ok: false });
+      }
+    });
+  });
+
+  // Final safety net for any route added later.
+  app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    console.error('Unhandled HTTP error:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ ok: false });
+    }
+  });
 
   const server = app.listen(config.port, async () => {
     console.log(`HTTP server listening on :${config.port}`);
@@ -114,6 +144,7 @@ async function bootstrap(): Promise<void> {
     await bot.api.setWebhook(webhookUrl, {
       drop_pending_updates: true,
       allowed_updates: ['message', 'callback_query'],
+      secret_token: config.webhookSecretToken,
     });
 
     await configureBotCommands(bot);
@@ -157,5 +188,11 @@ async function configureBotCommands(bot: Bot<Context>): Promise<void> {
     console.error('Failed to configure bot commands/description:', error);
   }
 }
+
+// A single failed update must not take the bot down: log it and keep serving
+// the other chats. Uncaught exceptions still terminate (unknown state).
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection:', reason);
+});
 
 void bootstrap();

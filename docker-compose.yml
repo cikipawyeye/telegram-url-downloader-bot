@@ -6,7 +6,9 @@ services:
     env_file:
       - .env
     ports:
-      - "${PORT:-3000}:3000"
+      # The app reads PORT from .env and listens on that port inside the
+      # container, so publish the same port instead of hardcoding 3000.
+      - "${PORT:-3000}:${PORT:-3000}"
     volumes:
       - bot_tmp:${DOWNLOAD_DIR:-/tmp/telegram-video-bot}
   tg-bot-api:

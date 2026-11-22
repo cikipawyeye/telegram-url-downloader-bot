@@ -5,6 +5,8 @@ export type AppConfig = {
   botToken: string;
   publicBaseUrl: string;
   webhookSecret: string;
+  /** Optional X-Telegram-Bot-Api-Secret-Token value (Telegram webhook auth). */
+  webhookSecretToken?: string;
   telegramApiRoot?: string;
   downloadDir: string;
   dbPath: string;
@@ -46,19 +48,26 @@ export function loadConfig(): AppConfig {
   }
 
   return {
-    port: Number(process.env.PORT ?? 3000),
+    port: readPositiveInteger(process.env.PORT, 3000),
     botToken,
     publicBaseUrl,
     webhookSecret,
+    webhookSecretToken: process.env.WEBHOOK_SECRET_TOKEN || undefined,
     telegramApiRoot: process.env.TELEGRAM_API_ROOT || undefined,
     downloadDir: process.env.DOWNLOAD_DIR ?? '/tmp/telegram-video-bot',
     dbPath: process.env.DB_PATH ?? path.join(process.env.DOWNLOAD_DIR ?? '/tmp/telegram-video-bot', 'bot.db'),
-    maxFileSizeBytes: Number(process.env.MAX_FILE_SIZE_BYTES ?? 2147483648),
-    downloadTimeoutMs: Number(process.env.DOWNLOAD_TIMEOUT_MS ?? 900000),
+    // The standard Bot API rejects uploads above 50 MB; a local Bot API server
+    // can handle the larger default. Using 2 GB unconditionally made nearly
+    // every normal video fail at send time after the full download.
+    maxFileSizeBytes: readNonNegativeNumber(
+      process.env.MAX_FILE_SIZE_BYTES,
+      process.env.TELEGRAM_API_ROOT ? 2147483648 : 50 * 1024 * 1024,
+    ),
+    downloadTimeoutMs: readNonNegativeNumber(process.env.DOWNLOAD_TIMEOUT_MS, 900000),
     // Automatic download attempts per link. Retries resume the leftover
     // partial file instead of starting over (see process-message.ts).
-    downloadRetries: Number(process.env.DOWNLOAD_RETRIES ?? 10),
-    downloadRetryBackoffMs: Number(process.env.DOWNLOAD_RETRY_BACKOFF_MS ?? 2000),
+    downloadRetries: Math.max(1, Math.floor(readNonNegativeNumber(process.env.DOWNLOAD_RETRIES, 10))),
+    downloadRetryBackoffMs: readNonNegativeNumber(process.env.DOWNLOAD_RETRY_BACKOFF_MS, 2000),
     // Links are prefetched while earlier links are still being converted and
     // sent, so 1 already overlaps download with delivery. Raise it only when
     // the disk can hold several large files at once: each slot may add a 4 GB+
@@ -69,7 +78,9 @@ export function loadConfig(): AppConfig {
     minFreeDiskBytes: readNonNegativeNumber(process.env.MIN_FREE_DISK_BYTES, 6442450944),
     downloadReserveBytes: readNonNegativeNumber(process.env.DOWNLOAD_RESERVE_BYTES, 4294967296),
     ytdlpProxy: process.env.YTDLP_PROXY || undefined,
-    screenshotCount: Number(process.env.SCREENSHOT_COUNT ?? 5),
+    // Telegram media groups allow at most 10 items; more screenshots than this
+    // can never be delivered as one album (plus the video item).
+    screenshotCount: Math.min(9, Math.max(1, Math.floor(readNonNegativeNumber(process.env.SCREENSHOT_COUNT, 5)))),
     sendVideoInAlbum: process.env.SEND_VIDEO_IN_ALBUM !== 'false',
     reencodeAnamorphic: process.env.REENCODE_ANAMORPHIC !== 'false',
     // Torrent downloads can be huge and Telegram cannot deliver them anyway;
@@ -87,4 +98,9 @@ function readNonNegativeNumber(value: string | undefined, fallback: number): num
 
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function readPositiveInteger(value: string | undefined, fallback: number): number {
+  const parsed = readNonNegativeNumber(value, fallback);
+  return parsed >= 1 ? Math.floor(parsed) : fallback;
 }

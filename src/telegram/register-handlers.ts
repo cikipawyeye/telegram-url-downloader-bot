@@ -32,7 +32,7 @@ const HELP_TEXT = [
   'Cara menggunakan bot ini:',
   '',
   '1. Kirimkan link video (YouTube, TikTok, dsb.) atau link magnet torrent sebagai pesan biasa.',
-  '2. Untuk bulk download, kirim beberapa link dalam satu pesan (maksimal 10 link).',
+  '2. Untuk bulk download, kirim beberapa link dalam satu pesan (maksimal 20 link).',
   '3. Bot akan mengunduh videonya lalu mengirimkannya kembali sebagai video yang bisa di-stream langsung di Telegram.',
   '',
   'Untuk mengubah ukuran video, gunakan /convert lalu pilih resolusi yang diinginkan (1080p, 720p, 480p, atau 240p), lalu kirimkan link videonya.',
@@ -132,10 +132,14 @@ export function registerBotHandlers(
       return;
     }
 
-    await audioMessageProcessor.process({
+    // Don't await the whole extraction inside the webhook: it easily exceeds
+    // Telegram's webhook timeout and the retry then processes the file twice.
+    void audioMessageProcessor.process({
       notifier,
       media,
       userId: String(ctx.from?.id ?? 'unknown'),
+    }).catch((error) => {
+      console.error('Audio processing failed:', error);
     });
   });
 
@@ -145,13 +149,17 @@ export function registerBotHandlers(
     const stopMatch = data.match(/^stop:download:(\d+)$/);
     if (stopMatch) {
       const statusMessageId = Number(stopMatch[1]);
-      // The status message id tells the two download flows apart.
-      const cancelled =
-        videoMessageProcessor.cancelDownload(statusMessageId) ||
-        audioMessageProcessor.cancelDownload(statusMessageId);
+      const chatId = ctx.chat?.id;
+      // Telegram message ids are per-chat: pass the chat so a Stop tap can
+      // never cancel another chat's job that happens to share the same id.
+      const cancelled = chatId !== undefined &&
+        (videoMessageProcessor.cancelDownload(chatId, statusMessageId) ||
+          audioMessageProcessor.cancelDownload(chatId, statusMessageId));
       // Record the request even when the in-memory entry is gone (e.g. after a
       // restart) so the job row reflects what the user asked for.
-      db.requestCancelByStatusMessage(statusMessageId);
+      if (chatId !== undefined) {
+        db.requestCancelByStatusMessage(chatId, statusMessageId);
+      }
       await ctx.answerCallbackQuery(cancelled ? 'Menghentikan unduhan...' : 'Tidak ada proses yang sedang berjalan.');
       return;
     }

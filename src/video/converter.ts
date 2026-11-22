@@ -205,9 +205,12 @@ export class VideoConverter {
       let stderr = '';
       let settled = false;
       let totalSeconds: number | null = null;
+      let timer: NodeJS.Timeout | undefined;
 
       const cleanup = () => {
-        clearTimeout(timer);
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
         if (signal) {
           signal.removeEventListener('abort', onAbort);
         }
@@ -233,7 +236,7 @@ export class VideoConverter {
         signal.addEventListener('abort', onAbort, { once: true });
       }
 
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         if (settled) {
           return;
         }

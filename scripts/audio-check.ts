@@ -321,6 +321,9 @@ function buildAudioNotifier(chatId: number) {
     async updateStatus(_statusMessage: StatusMessage, text: string): Promise<void> {
       statuses.push(text);
     },
+    async failStatus(_statusMessage: StatusMessage, text: string): Promise<void> {
+      statuses.push(text);
+    },
     async updateProgress(_statusMessage: StatusMessage, text: string): Promise<void> {
       statuses.push(text);
     },

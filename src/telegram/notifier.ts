@@ -27,6 +27,7 @@ export class TelegramNotifier {
   private pendingProgressTimer: NodeJS.Timeout | null = null;
   private pendingProgressText: string | null = null;
   private statusMessageClosed = false;
+  private statusMessageClosing = false;
   private statusUpdateChain: Promise<void> = Promise.resolve();
   private stopButtonActive = false;
   private stopButtonCallbackData: string | null = null;
@@ -81,33 +82,73 @@ export class TelegramNotifier {
     });
     this.lastStatusText = message.text;
     this.statusMessageClosed = false;
+    this.statusMessageClosing = false;
     this.stopButtonActive = false;
     this.stopButtonCallbackData = null;
     return { messageId: message.message_id };
   }
 
   async addDownloadStopButton(statusMessage: StatusMessage, callbackData: string): Promise<void> {
+    if (this.statusMessageClosed || this.statusMessageClosing) {
+      return;
+    }
+
     this.stopButtonActive = true;
     this.stopButtonCallbackData = callbackData;
-    await this.editStatusText(statusMessage.messageId, this.lastStatusText ?? '', this.buildStatusKeyboard());
+    try {
+      await this.editStatusText(statusMessage.messageId, this.lastStatusText ?? '', this.buildStatusKeyboard());
+    } catch (error) {
+      // The button is cosmetic; a failed edit must not abort the download.
+      console.error('Failed to add the stop button:', error);
+    }
   }
 
   async removeDownloadStopButton(statusMessage: StatusMessage): Promise<void> {
+    if (this.statusMessageClosed || this.statusMessageClosing) {
+      return;
+    }
+
     this.stopButtonActive = false;
     this.stopButtonCallbackData = null;
-    await this.editStatusText(statusMessage.messageId, this.lastStatusText ?? '', this.buildStatusKeyboard());
+    try {
+      await this.editStatusText(statusMessage.messageId, this.lastStatusText ?? '', this.buildStatusKeyboard());
+    } catch (error) {
+      console.error('Failed to remove the stop button:', error);
+    }
   }
 
   async confirmStopped(statusMessage: StatusMessage): Promise<void> {
     this.clearPendingProgress();
-    this.statusMessageClosed = true;
+    this.statusMessageClosing = true;
     this.stopButtonActive = false;
     this.stopButtonCallbackData = null;
-    await this.editStatusText(statusMessage.messageId, 'Unduhan dihentikan.', new InlineKeyboard());
+
+    try {
+      await this.editStatusText(statusMessage.messageId, 'Unduhan dihentikan.', new InlineKeyboard());
+      this.statusMessageClosed = true;
+    } catch (error) {
+      // The status message may already be gone; don't leave the notifier in a
+      // half-closed state that silently drops every later update.
+      this.statusMessageClosing = false;
+      console.error('Failed to confirm the stopped download:', error);
+    } finally {
+      this.statusMessageClosing = false;
+    }
+  }
+
+  /**
+   * Final error text with the Stop button removed in the same edit. Used when a
+   * batch dies outside the normal per-link error path.
+   */
+  async failStatus(statusMessage: StatusMessage, text: string): Promise<void> {
+    this.clearPendingProgress();
+    this.stopButtonActive = false;
+    this.stopButtonCallbackData = null;
+    await this.enqueueStatusUpdate(statusMessage, text);
   }
 
   async updateStatus(statusMessage: StatusMessage, text: string): Promise<void> {
-    if (this.statusMessageClosed) {
+    if (this.statusMessageClosed || this.statusMessageClosing) {
       return;
     }
 
@@ -116,7 +157,7 @@ export class TelegramNotifier {
   }
 
   async updateProgress(statusMessage: StatusMessage, text: string): Promise<void> {
-    if (this.statusMessageClosed) {
+    if (this.statusMessageClosed || this.statusMessageClosing) {
       return;
     }
 
@@ -143,7 +184,10 @@ export class TelegramNotifier {
    * first photo because Telegram only shows the first item's caption.
    */
   async sendScreenshots(screenshots: VideoScreenshot[], caption?: string): Promise<void> {
-    const media = screenshots.map((screenshot, index) => ({
+    // Telegram rejects media groups with more than 10 items; SCREENSHOT_COUNT
+    // is user configurable, so enforce the hard limit defensively.
+    const limited = screenshots.slice(0, MEDIA_GROUP_MAX_ITEMS);
+    const media = limited.map((screenshot, index) => ({
       type: 'photo' as const,
       media: new InputFile(screenshot.filePath, screenshot.fileName),
       ...(index === 0 && caption !== undefined ? { caption } : {}),
@@ -188,7 +232,7 @@ export class TelegramNotifier {
         height: video.height,
         supports_streaming: true,
       },
-      ...screenshots.map((screenshot) => ({
+      ...screenshots.slice(0, MEDIA_GROUP_MAX_ITEMS - 1).map((screenshot) => ({
         type: 'photo' as const,
         media: new InputFile(screenshot.filePath, screenshot.fileName),
       })),
@@ -236,16 +280,26 @@ export class TelegramNotifier {
 
   async deleteStatus(statusMessage: StatusMessage): Promise<void> {
     this.clearPendingProgress();
-    this.statusMessageClosed = true;
+    this.statusMessageClosing = true;
     this.stopButtonActive = false;
     this.stopButtonCallbackData = null;
 
     this.statusUpdateChain = this.statusUpdateChain
       .catch(() => undefined)
       .then(async () => {
-        await this.bot.api.deleteMessage(this.getChatId(), statusMessage.messageId);
-        this.lastStatusText = null;
-        this.lastProgressUpdateAt = 0;
+        try {
+          await this.bot.api.deleteMessage(this.getChatId(), statusMessage.messageId);
+          this.statusMessageClosed = true;
+          this.lastStatusText = null;
+          this.lastProgressUpdateAt = 0;
+        } catch (error) {
+          // Deleting is cosmetic. Closing the notifier anyway would make the
+          // stale "Sedang mengirim..." message permanent, so leave it open and
+          // let a later update replace the text.
+          console.error('Failed to delete status message:', error);
+        } finally {
+          this.statusMessageClosing = false;
+        }
       });
 
     await this.statusUpdateChain;
@@ -296,7 +350,7 @@ export class TelegramNotifier {
   }
 
   private async flushPendingProgress(statusMessage: StatusMessage): Promise<void> {
-    if (this.statusMessageClosed) {
+    if (this.statusMessageClosed || this.statusMessageClosing) {
       this.pendingProgressText = null;
       return;
     }
@@ -323,14 +377,14 @@ export class TelegramNotifier {
   }
 
   private async enqueueStatusUpdate(statusMessage: StatusMessage, text: string): Promise<void> {
-    if (this.statusMessageClosed || text === this.lastStatusText) {
+    if (this.statusMessageClosed || this.statusMessageClosing || text === this.lastStatusText) {
       return;
     }
 
     this.statusUpdateChain = this.statusUpdateChain
       .catch(() => undefined)
       .then(async () => {
-        if (this.statusMessageClosed || text === this.lastStatusText) {
+        if (this.statusMessageClosed || this.statusMessageClosing || text === this.lastStatusText) {
           return;
         }
 

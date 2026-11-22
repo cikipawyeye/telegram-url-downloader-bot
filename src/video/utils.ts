@@ -162,7 +162,15 @@ function extractGoogleDriveFileIdentity(url: string): string | undefined {
 export function buildDeliveryFileName(filePath: string, title: string): string {
   const extension = path.extname(filePath);
   const fallbackBaseName = path.basename(filePath, extension);
-  const preferredBaseName = title.trim() || fallbackBaseName;
+  const trimmedTitle = title.trim();
+  const titleExtension = path.extname(trimmedTitle);
+  // yt-dlp titles often already include the media extension ("Movie.mp4");
+  // appending it again produced "Movie.mp4.mp4".
+  const preferredBaseName = (
+    titleExtension.length > 0 && titleExtension.toLowerCase() === extension.toLowerCase()
+      ? trimmedTitle.slice(0, -titleExtension.length)
+      : trimmedTitle
+  ) || fallbackBaseName;
   const normalizedBaseName = sanitizeFileName(preferredBaseName)
     .replace(/\s+/g, ' ')
     .trim()

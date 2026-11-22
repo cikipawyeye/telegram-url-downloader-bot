@@ -1,11 +1,13 @@
 import { spawn } from 'node:child_process';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import { DownloadCancelledError } from './downloader.js';
 import { buildScreenshotPlan, type VideoScreenshot, type VideoThumbnail } from './utils.js';
 
 const TELEGRAM_THUMBNAIL_FILE_NAME = 'thumbnail.jpg';
 const TELEGRAM_THUMBNAIL_MAX_BYTES = 200 * 1024;
 const TELEGRAM_THUMBNAIL_MAX_DIMENSION = 320;
+const SCREENSHOT_MAX_DIMENSION = 1920;
 const TELEGRAM_THUMBNAIL_QUALITY_VALUES = [4, 8, 12, 16, 20, 24, 28, 31];
 
 /**
@@ -27,12 +29,14 @@ export type GenerateScreenshotsOptions = {
   outputDir: string;
   durationSeconds?: number;
   count: number;
+  signal?: AbortSignal;
 };
 
 export type GenerateThumbnailOptions = {
   videoPath: string;
   outputDir: string;
   durationSeconds?: number;
+  signal?: AbortSignal;
 };
 
 export class VideoScreenshotGenerator {
@@ -47,11 +51,16 @@ export class VideoScreenshotGenerator {
     durationSeconds,
     outputDir,
     videoPath,
+    signal,
   }: GenerateScreenshotsOptions): Promise<VideoScreenshot[]> {
+    if (signal?.aborted) {
+      throw new DownloadCancelledError();
+    }
+
     const screenshotsDir = path.join(outputDir, 'screenshots');
     await fsp.mkdir(screenshotsDir, { recursive: true });
 
-    const mediaInfo = await this.probeMediaInfo(videoPath);
+    const mediaInfo = await this.probeMediaInfo(videoPath, signal);
     const resolvedDurationSeconds =
       durationSeconds !== undefined && durationSeconds > 0
         ? durationSeconds
@@ -66,6 +75,10 @@ export class VideoScreenshotGenerator {
     const screenshots: VideoScreenshot[] = [];
 
     for (const item of screenshotPlan) {
+      if (signal?.aborted) {
+        throw new DownloadCancelledError();
+      }
+
       const filePath = path.join(screenshotsDir, item.fileName);
       const captured = await this.captureScreenshot({
         aspectFilter,
@@ -73,6 +86,7 @@ export class VideoScreenshotGenerator {
         filePath,
         preferredCaptureSeconds: item.captureSeconds,
         videoPath,
+        signal,
       });
 
       if (!captured) {
@@ -92,10 +106,15 @@ export class VideoScreenshotGenerator {
     durationSeconds,
     outputDir,
     videoPath,
+    signal,
   }: GenerateThumbnailOptions): Promise<VideoThumbnail> {
+    if (signal?.aborted) {
+      throw new DownloadCancelledError();
+    }
+
     await fsp.mkdir(outputDir, { recursive: true });
     const filePath = path.join(outputDir, TELEGRAM_THUMBNAIL_FILE_NAME);
-    const mediaInfo = await this.probeMediaInfo(videoPath);
+    const mediaInfo = await this.probeMediaInfo(videoPath, signal);
     const resolvedDurationSeconds =
       durationSeconds !== undefined && durationSeconds > 0
         ? durationSeconds
@@ -111,6 +130,7 @@ export class VideoScreenshotGenerator {
       filePath,
       preferredCaptureSeconds: resolvedDurationSeconds * 0.5,
       videoPath,
+      signal,
     });
 
     if (!captured) {
@@ -129,13 +149,22 @@ export class VideoScreenshotGenerator {
     filePath: string;
     preferredCaptureSeconds: number;
     videoPath: string;
+    signal?: AbortSignal;
   }): Promise<boolean> {
     const captureTimes = this.buildCaptureFallbacks(
       options.preferredCaptureSeconds,
       options.durationSeconds,
     );
+    const videoFilter = [
+      options.aspectFilter,
+      `scale=min(${SCREENSHOT_MAX_DIMENSION}\\,iw):-2`,
+    ].filter(Boolean).join(',');
 
     for (const captureSeconds of captureTimes) {
+      if (options.signal?.aborted) {
+        throw new DownloadCancelledError();
+      }
+
       await fsp.rm(options.filePath, { force: true });
 
       await this.runCommand('ffmpeg', [
@@ -148,11 +177,12 @@ export class VideoScreenshotGenerator {
         options.videoPath,
         '-frames:v',
         '1',
-        ...(options.aspectFilter ? ['-vf', options.aspectFilter] : []),
+        '-vf',
+        videoFilter,
         '-q:v',
         '2',
         options.filePath,
-      ]);
+      ], options.signal);
 
       if (await fileExistsWithContent(options.filePath)) {
         return true;
@@ -168,6 +198,7 @@ export class VideoScreenshotGenerator {
     filePath: string;
     preferredCaptureSeconds: number;
     videoPath: string;
+    signal?: AbortSignal;
   }): Promise<boolean> {
     const captureTimes = this.buildCaptureFallbacks(
       options.preferredCaptureSeconds,
@@ -182,6 +213,10 @@ export class VideoScreenshotGenerator {
     // ponytail: per-output `-update` needs ffmpeg >= 5.1; fall back to the
     // one-command-per-quality loop if older builds ever matter.
     for (const captureSeconds of captureTimes) {
+      if (options.signal?.aborted) {
+        throw new DownloadCancelledError();
+      }
+
       await fsp.rm(options.filePath, { force: true });
       await Promise.all(candidatePaths.map((candidate) => fsp.rm(candidate, { force: true })));
 
@@ -213,7 +248,7 @@ export class VideoScreenshotGenerator {
         '-vf',
         videoFilter,
         ...outputArgs,
-      ]);
+      ], options.signal);
 
       // Prefer the highest quality that fits Telegram's size cap.
       for (const index of TELEGRAM_THUMBNAIL_QUALITY_VALUES.keys()) {
@@ -249,7 +284,7 @@ export class VideoScreenshotGenerator {
     )).map(Number);
   }
 
-  private async probeMediaInfo(videoPath: string): Promise<{
+  private async probeMediaInfo(videoPath: string, signal?: AbortSignal): Promise<{
     durationSeconds?: number;
     sampleAspectRatio?: string;
   }> {
@@ -263,7 +298,7 @@ export class VideoScreenshotGenerator {
       '-of',
       'json',
       videoPath,
-    ]);
+    ], signal);
 
     let parsed: {
       streams?: Array<{ sample_aspect_ratio?: string }>;
@@ -284,7 +319,7 @@ export class VideoScreenshotGenerator {
     };
   }
 
-  private async runCommand(command: string, args: string[]): Promise<string> {
+  private async runCommand(command: string, args: string[], signal?: AbortSignal): Promise<string> {
     return await new Promise<string>((resolve, reject) => {
       const child = spawn(command, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -293,16 +328,45 @@ export class VideoScreenshotGenerator {
       let stdout = '';
       let stderr = '';
       let settled = false;
+      let timer: NodeJS.Timeout | undefined;
 
-      const timer = setTimeout(() => {
+      const cleanup = () => {
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
+        signal?.removeEventListener('abort', onAbort);
+      };
+
+      const onAbort = () => {
         if (settled) {
           return;
         }
 
         settled = true;
+        cleanup();
+        child.kill('SIGKILL');
+        reject(new DownloadCancelledError());
+      };
+
+      timer = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
         child.kill('SIGKILL');
         reject(new Error(`${command} timeout setelah ${Math.round(this.commandTimeoutMs / 1000)} detik.`));
       }, this.commandTimeoutMs);
+
+      if (signal) {
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
 
       child.stdout.on('data', (chunk) => {
         stdout += String(chunk);
@@ -318,7 +382,7 @@ export class VideoScreenshotGenerator {
         }
 
         settled = true;
-        clearTimeout(timer);
+        cleanup();
         reject(error);
       });
 
@@ -328,7 +392,7 @@ export class VideoScreenshotGenerator {
         }
 
         settled = true;
-        clearTimeout(timer);
+        cleanup();
 
         if (code === 0) {
           resolve(stdout);

@@ -74,7 +74,7 @@ function checkDatabase(): void {
   const db = new BotDatabase(`${TMP_DIR}/database.db`);
 
   check(
-    Number(db.db.prepare('PRAGMA user_version').get()!.user_version) === 4,
+    Number(db.db.prepare('PRAGMA user_version').get()!.user_version) === 5,
     'the tag migration (job_items.tag, pending_tags) should have been applied',
   );
 

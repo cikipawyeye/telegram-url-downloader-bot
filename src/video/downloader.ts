@@ -380,9 +380,13 @@ export class VideoDownloader {
       throw new Error('Link magnet butuh binary aria2c yang belum terpasang di server.');
     }
 
-    // A hex info hash names the cache file directly; base32 magnets skip the
-    // lookup and cache under their decoded hex hash after the fetch.
-    const magnetHash = extractMagnetInfoHash(magnet);
+    // A hex info hash names the cache file directly. Base32 magnets are
+    // decoded to hex too, so they hit the same cache entry instead of fetching
+    // the metadata again on every run.
+    const rawMagnetHash = extractMagnetInfoHash(magnet);
+    const magnetHash = rawMagnetHash !== undefined && /^[a-z2-7]{32}$/i.test(rawMagnetHash)
+      ? base32InfoHashToHex(rawMagnetHash)
+      : rawMagnetHash;
     const cacheDir = magnetMetaCacheDir();
     const directCacheFile = magnetHash !== undefined && /^[0-9a-f]{40}$/.test(magnetHash)
       ? path.join(cacheDir, `${magnetHash}.torrent`)
@@ -468,8 +472,12 @@ export class VideoDownloader {
     await fsp.mkdir(options.outputDir, { recursive: true });
     const outputPath = path.join(options.outputDir, ...entry.pathParts);
     const existing = await fsp.stat(outputPath).catch(() => undefined);
+    const controlFile = `${outputPath}.aria2`;
+    // An aria2 control file means the download is still incomplete even when
+    // the file already has its final size (trunc/falloc preallocation).
+    const controlExists = await fsp.stat(controlFile).then(() => true).catch(() => false);
 
-    if (existing !== undefined && existing.size >= entry.length) {
+    if (existing !== undefined && existing.size === entry.length && !controlExists) {
       // The workspace already holds the complete file (earlier attempt that
       // failed later in the pipeline): deliver it without hitting the swarm.
       const metadataProbe = await this.resolveVideoMetadata(outputPath, {});
@@ -495,9 +503,10 @@ export class VideoDownloader {
         '--no-conf',
         `--select-file=${entry.index}`,
         `--dir=${options.outputDir}`,
-        // `trunc` is instant on every filesystem (falloc is not universally
-        // available and prealloc blocks for seconds on multi-GB files).
-        '--file-allocation=trunc',
+        // Never preallocate: `trunc` instantly creates a full-size sparse file,
+        // which looks complete after a kill and used to be delivered as a
+        // corrupt video on the next attempt.
+        '--file-allocation=none',
         // Stop seeding the moment the download completes: the bot delivers
         // files, it is not a long-lived seeder.
         '--seed-time=0',
@@ -523,6 +532,13 @@ export class VideoDownloader {
     const stat = await fsp.stat(outputPath).catch(() => undefined);
     if (stat === undefined) {
       throw new Error(`File hasil download torrent tidak ditemukan (${fileName}).`);
+    }
+
+    const leftoverControl = await fsp.stat(controlFile).then(() => true).catch(() => false);
+    if (leftoverControl || stat.size !== entry.length) {
+      throw new Error(
+        `Download torrent belum lengkap (${formatBytes(stat.size)} dari ${formatBytes(entry.length)}). Coba kirim ulang link untuk melanjutkan.`,
+      );
     }
 
     const metadataProbe = await this.resolveVideoMetadata(outputPath, {});
@@ -592,9 +608,12 @@ export class VideoDownloader {
 
     await new Promise<void>((resolve, reject) => {
       let settled = false;
+      let timer: NodeJS.Timeout | undefined;
 
       const cleanup = () => {
-        clearTimeout(timer);
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
         options.signal?.removeEventListener('abort', onAbort);
       };
 
@@ -609,7 +628,7 @@ export class VideoDownloader {
         reject(new DownloadCancelledError());
       };
 
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         if (settled) {
           return;
         }
@@ -742,9 +761,12 @@ export class VideoDownloader {
 
     await new Promise<void>((resolve, reject) => {
       let settled = false;
+      let timer: NodeJS.Timeout | undefined;
 
       const cleanup = () => {
-        clearTimeout(timer);
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
         options.signal?.removeEventListener('abort', onAbort);
       };
 
@@ -759,7 +781,7 @@ export class VideoDownloader {
         reject(new DownloadCancelledError());
       };
 
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         if (settled) {
           return;
         }
@@ -1083,9 +1105,12 @@ export class VideoDownloader {
   ): Promise<DownloadFinishResult> {
     return await new Promise<DownloadFinishResult>((resolve, reject) => {
       let settled = false;
+      let timer: NodeJS.Timeout | undefined;
 
       const cleanup = () => {
-        clearTimeout(timer);
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
         if (signal) {
           signal.removeEventListener('abort', onAbort);
         }
@@ -1111,7 +1136,7 @@ export class VideoDownloader {
         signal.addEventListener('abort', onAbort, { once: true });
       }
 
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         if (settled) {
           return;
         }
@@ -1896,6 +1921,33 @@ function parseJsonRecord(text: string): Record<string, unknown> | undefined {
     return undefined;
   }
   return parsed as Record<string, unknown>;
+}
+
+/** Decode a 32-character base32 BitTorrent info hash into 40 hex characters. */
+function base32InfoHashToHex(value: string): string | undefined {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  const bytes: number[] = [];
+  let buffer = 0;
+  let bits = 0;
+
+  for (const character of value.toUpperCase()) {
+    const index = alphabet.indexOf(character);
+
+    if (index === -1) {
+      return undefined;
+    }
+
+    buffer = (buffer << 5) | index;
+    bits += 5;
+
+    if (bits >= 8) {
+      bytes.push((buffer >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+
+  const hex = Buffer.from(bytes).toString('hex');
+  return hex.length === 40 ? hex : undefined;
 }
 
 function isAbortError(error: unknown): boolean {
