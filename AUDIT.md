@@ -86,12 +86,33 @@ mengunci notifier bila edit gagal.
 
 ## Tinggi
 
-### T1. Slot download global + retry 10×15 menit ⬜
-Default `DOWNLOAD_CONCURRENCY=1`, timeout 15 menit, retry 10 kali. Satu link
-mati dapat menahan slot global hingga ~25 jam dan memblokir semua chat.
-**Mitigasi saat ini:** retry tetap ada, tetapi Stop tetap bisa membatalkan
-job yang sedang berjalan. Kebijakan retry perlu dipersempit untuk error
-non-retryable pada iterasi berikutnya.
+### T1. Slot download global + retry 10×15 menit ✅
+Default lama: `DOWNLOAD_CONCURRENCY=1`, timeout 15 menit, retry 10 kali. Satu
+link mati dapat menahan slot global hingga ~25 jam dan memblokir semua chat.
+
+**Perbaikan:**
+- Error diklasifikasi menjadi `permanent` (video privat/unavailable, login/usia,
+  geo-block, URL/format tidak didukung, HTTP 400/401/403/404/410/451, disk/izin,
+  batas torrent) dan `transient` (timeout, reset koneksi, DNS, HTTP 429/5xx,
+  peer torrent belum ada). Error permanen hanya dicoba **sekali**.
+- Error proxy (`ProxyError`, `Socks5Error`, `connection refused` saat proxy
+  aktif) tetap **transient**. Bot menunggu port proxy lokal menerima koneksi
+  (probe TCP, default maksimal 120 detik) sebelum mencoba lagi; percobaan tetap
+  dihitung, tetapi tidak dihabiskan saat proxy belum siap.
+- Default percobaan turun menjadi `DOWNLOAD_RETRIES=3` (total attempt) dengan
+  backoff eksponensial `2s, 4s, ...` (maksimal 60 detik + jitter).
+- `DOWNLOAD_RETRY_BUDGET_MS` (default 30 menit) membatasi jeda retry dan
+  dimulainya percobaan berikutnya. Percobaan yang sedang berjalan tetap dibatasi
+  `DOWNLOAD_TIMEOUT_MS`, jadi budget bukan hard-kill di tengah download.
+  Bila budget habis, percobaan berikutnya tidak dijalankan dan link berhenti
+  dengan pesan yang jelas.
+- Slot global dan reservasi disk sekarang diambil **per attempt** dan dilepas
+  sebelum backoff, sehingga link yang menunggu retry tidak memblokir chat lain.
+  Workspace/partial tetap dipakai ulang sehingga resume tidak rusak.
+- Pesan status membedakan error permanen (`Tidak akan dicoba ulang.`), error
+  sementara, penantian proxy, dan saran `noproxy <link>` saat proxy mati.
+- Dokumen ini tidak mengklaim deteksi download mandek; timeout tetap per attempt
+  (`DOWNLOAD_TIMEOUT_MS`).
 
 ### T2. Prefetch tanpa back-pressure ⬜
 Prefetch mengunduh semua link batch sementara pengiriman berurutan; disk bisa
@@ -190,7 +211,12 @@ dengan local Bot API server.
 - Splitter diuji dengan MKV ber-subtitle ASS: part berhasil dibuat (sebelumnya
   0 byte) dan direktori retry lama dibersihkan.
 - `buildDeliveryFileName` diuji untuk judul yang sudah berisi ekstensi.
+- `scripts/retry-policy-check.ts` menguji klasifikasi permanen/transient/proxy,
+  batas jumlah attempt, retry budget, pelepasan slot saat backoff, Stop saat
+  backoff, proxy yang pulih setelah probe, dan proxy mati dengan saran
+  `noproxy`.
 - `README.md` dan `.env.example` dicek ulang terhadap `config.ts` dan perilaku
   kode: default `MAX_FILE_SIZE_BYTES` (50 MiB standar / 2 GiB local Bot API),
-  `DOWNLOAD_TIMEOUT_MS`, retry, `SCREENSHOT_COUNT`, `MAX_BULK_URLS`,
-  `WEBHOOK_SECRET_TOKEN`, port Compose, dan perilaku Stop/restart.
+  `DOWNLOAD_TIMEOUT_MS`, retry/budget/proxy wait, `SCREENSHOT_COUNT`,
+  `MAX_BULK_URLS`, `WEBHOOK_SECRET_TOKEN`, port Compose, dan perilaku
+  Stop/restart.

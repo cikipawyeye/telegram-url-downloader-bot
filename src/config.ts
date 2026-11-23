@@ -14,6 +14,10 @@ export type AppConfig = {
   downloadTimeoutMs: number;
   downloadRetries: number;
   downloadRetryBackoffMs: number;
+  /** Wall-clock cap for all attempts of one link (0 = unlimited). */
+  downloadRetryBudgetMs: number;
+  /** How long to wait for a refusing local proxy to accept connections again. */
+  downloadProxyWaitMs: number;
   /** How many links may download at the same time, process-wide. */
   downloadConcurrency: number;
   /** Free space that must stay untouched after active reservations. */
@@ -64,10 +68,17 @@ export function loadConfig(): AppConfig {
       process.env.TELEGRAM_API_ROOT ? 2147483648 : 50 * 1024 * 1024,
     ),
     downloadTimeoutMs: readNonNegativeNumber(process.env.DOWNLOAD_TIMEOUT_MS, 900000),
-    // Automatic download attempts per link. Retries resume the leftover
-    // partial file instead of starting over (see process-message.ts).
-    downloadRetries: Math.max(1, Math.floor(readNonNegativeNumber(process.env.DOWNLOAD_RETRIES, 10))),
+    // Total attempts per link. Retries resume the leftover partial file
+    // instead of starting over (see process-message.ts). Permanent errors
+    // (private video, 404, unsupported URL) still fail after the first attempt.
+    downloadRetries: Math.max(1, Math.floor(readNonNegativeNumber(process.env.DOWNLOAD_RETRIES, 3))),
     downloadRetryBackoffMs: readNonNegativeNumber(process.env.DOWNLOAD_RETRY_BACKOFF_MS, 2000),
+    // Wall-clock cap for all attempts of one link, so a dead link cannot hold the
+    // queue for hours even with the per-attempt timeout. 0 disables the cap.
+    downloadRetryBudgetMs: readNonNegativeNumber(process.env.DOWNLOAD_RETRY_BUDGET_MS, 1_800_000),
+    // A local WARP/SOCKS proxy may refuse connections while it restarts; probe
+    // its TCP port for a while instead of burning attempts immediately.
+    downloadProxyWaitMs: readNonNegativeNumber(process.env.DOWNLOAD_PROXY_WAIT_MS, 120_000),
     // Links are prefetched while earlier links are still being converted and
     // sent, so 1 already overlaps download with delivery. Raise it only when
     // the disk can hold several large files at once: each slot may add a 4 GB+

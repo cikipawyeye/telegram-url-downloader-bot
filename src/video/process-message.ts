@@ -7,6 +7,8 @@ import type { TelegramNotifier } from '../telegram/notifier.js';
 import { buildDeliveryFileName, buildDeliveryPartFileName, buildPartCaption, buildFailureSummary, formatBytes, downloadIdentity, hasNoProxyOverride, parseVideoRequestItems, summarizeErrorMessage, truncateCaption, type BatchFailure, type DownloadedVideo, type VideoRequestItem, type VideoThumbnail } from './utils.js';
 import type { VideoDownloader } from './downloader.js';
 import { DownloadCancelledError } from './downloader.js';
+import { DownloadFailure, classifyDownloadError, type DownloadErrorClassification } from './download-errors.js';
+import { waitForProxyReady } from './proxy-readiness.js';
 import { BatchProgressReporter } from './batch-progress.js';
 import { DownloadSlots } from './download-slots.js';
 import { buildPixelAspectFilter } from './screenshots.js';
@@ -104,6 +106,12 @@ export class VideoMessageProcessor {
   private readonly reencodeAnamorphic: boolean;
   private readonly downloadRetries: number;
   private readonly downloadRetryBackoffMs: number;
+  /** Wall-clock cap for all attempts of one link (0 = unlimited). */
+  private readonly downloadRetryBudgetMs: number;
+  /** How long to probe a refusing local proxy before giving up on the link. */
+  private readonly downloadProxyWaitMs: number;
+  /** Configured proxy; used to tell proxy failures apart from site failures. */
+  private readonly proxy?: string;
   private readonly downloadSlots: DownloadSlots;
   private readonly diskGuard?: DiskSpaceGuard;
   private readonly diskWaitAttempts: number;
@@ -120,10 +128,16 @@ export class VideoMessageProcessor {
     screenshotCount: number;
     sendVideoInAlbum: boolean;
     reencodeAnamorphic: boolean;
-    /** Automatic download attempts per link; each retry resumes the partial. */
+    /** Total download attempts per link; each retry resumes the partial. */
     downloadRetries?: number;
-    /** Base delay between attempts, multiplied by the attempt number. */
+    /** Base delay between attempts; doubles per attempt, capped at 60s. */
     downloadRetryBackoffMs?: number;
+    /** Wall-clock cap for the retries of one link (0 = unlimited). */
+    downloadRetryBudgetMs?: number;
+    /** Time to wait for a local proxy to accept connections again (0 = skip). */
+    downloadProxyWaitMs?: number;
+    /** Configured proxy URL; enables proxy readiness checks and classification. */
+    proxy?: string;
     /** Process-wide download limiter; share one instance across chats. */
     downloadSlots?: DownloadSlots;
     /** Disk admission control for large downloads; omitted in lightweight tests. */
@@ -143,8 +157,11 @@ export class VideoMessageProcessor {
     this.screenshotCount = options.screenshotCount;
     this.sendVideoInAlbum = options.sendVideoInAlbum;
     this.reencodeAnamorphic = options.reencodeAnamorphic;
-    this.downloadRetries = options.downloadRetries ?? 10;
-    this.downloadRetryBackoffMs = options.downloadRetryBackoffMs ?? 2000;
+    this.downloadRetries = Math.max(1, Math.floor(options.downloadRetries ?? 3));
+    this.downloadRetryBackoffMs = Math.max(0, options.downloadRetryBackoffMs ?? 2000);
+    this.downloadRetryBudgetMs = Math.max(0, options.downloadRetryBudgetMs ?? 1_800_000);
+    this.downloadProxyWaitMs = Math.max(0, options.downloadProxyWaitMs ?? 120_000);
+    this.proxy = options.proxy;
     this.downloadSlots = options.downloadSlots ?? new DownloadSlots(1);
     this.diskGuard = options.diskGuard;
     this.diskWaitAttempts = Math.max(1, options.diskWaitAttempts ?? 4);
@@ -451,7 +468,7 @@ export class VideoMessageProcessor {
         }
 
         const reason = summarizeErrorMessage(slot.error);
-        failed.push({ url: slot.item.url, reason });
+        failed.push({ url: slot.item.url, reason: this.failureSummaryReason(slot.error) });
         slot.state = 'failed';
         console.error(`Failed to process bulk URL ${slot.item.url}:`, slot.error);
         if (slot.itemId !== undefined) {
@@ -460,7 +477,7 @@ export class VideoMessageProcessor {
         const hasNextLink = index + 1 < items.length;
         await notifier.updateStatus(
           acceptedMessage,
-          `Link ${index + 1}/${items.length} gagal: ${reason}\nKirim ulang link ini untuk melanjutkan dari posisi terakhir.${hasNextLink ? '\nLanjut ke link berikutnya...' : ''}`,
+          `Link ${index + 1}/${items.length} gagal: ${reason}\n${this.failureHint(slot.error)}${hasNextLink ? '\nLanjut ke link berikutnya...' : ''}`,
         );
         continue;
       }
@@ -506,7 +523,7 @@ export class VideoMessageProcessor {
         }
         await notifier.updateStatus(
           acceptedMessage,
-          `Link ${index + 1}/${items.length} gagal: ${reason}\nKirim ulang link ini untuk melanjutkan dari posisi terakhir.`,
+          `Link ${index + 1}/${items.length} gagal: ${reason}\n${this.failureHint(error)}`,
         );
       } finally {
         // On success the workspace is dead weight. On failure/cancel it keeps
@@ -669,10 +686,14 @@ export class VideoMessageProcessor {
   }
 
   /**
-   * Download one prefetched link: wait for a download slot, reserve disk space,
-   * claim a resumable partial, then run the retrying download. The outcome is
-   * stored on the slot, so `task` never rejects and the delivery loop can
-   * inspect it when the link's turn comes.
+   * Download one prefetched link. A download slot and a disk reservation are
+   * taken **per attempt** and released before the backoff, so one link waiting
+   * for its retry never blocks another chat's download. The workspace is created
+   * on the first attempt and reused by every retry, which is what makes
+   * `yt-dlp --continue` / aria2 resume the leftover partial file.
+   *
+   * The outcome is stored on the slot, so `task` never rejects and the delivery
+   * loop can inspect it when the link's turn comes.
    */
   private async prefetchItem(options: {
     slot: PrefetchSlot;
@@ -682,37 +703,9 @@ export class VideoMessageProcessor {
     reporter: BatchProgressReporter;
   }): Promise<void> {
     const { slot, userId, total, batch, reporter } = options;
-    const { signal, jobId } = batch;
 
     try {
-      await this.downloadSlots.acquire(signal);
-
-      try {
-        const releaseDisk = await this.reserveDownloadDisk(signal);
-
-        try {
-          slot.workspace = await this.workspaceManager.create(userId, { reuseDir: slot.resumable?.resumeDir });
-
-          if (jobId !== undefined) {
-            slot.itemId = this.db?.addItem(jobId, slot.item.url, {
-              noProxy: slot.item.noProxy,
-              tag: batch.tag,
-            });
-
-            if (slot.itemId !== undefined) {
-              this.db?.setItemResumeDir(slot.itemId, slot.workspace.dirPath);
-            }
-          }
-
-          slot.video = await this.downloadWithRetries({ slot, total, signal, reporter });
-        } finally {
-          releaseDisk?.();
-        }
-      } finally {
-        // Released even when the download failed, so the next prefetched link
-        // (or another chat's link) can start immediately.
-        this.downloadSlots.release();
-      }
+      slot.video = await this.downloadWithRetries({ slot, userId, total, batch, reporter });
     } catch (error) {
       slot.error = error;
 
@@ -726,6 +719,40 @@ export class VideoMessageProcessor {
       slot.settled = true;
       reporter.markFinished(slot.index);
     }
+  }
+
+  /**
+   * Create the workspace and job item exactly once per link. Called after the
+   * disk reservation of the first attempt so a full disk fails before an empty
+   * workspace is created, and before `download()` so every retry writes into the
+   * same directory.
+   */
+  private async ensureWorkspace(
+    slot: PrefetchSlot,
+    userId: string,
+    batch: BatchOptions,
+  ): Promise<DownloadWorkspace> {
+    if (slot.workspace !== undefined) {
+      return slot.workspace;
+    }
+
+    const workspace = await this.workspaceManager.create(userId, {
+      reuseDir: slot.resumable?.resumeDir,
+    });
+    slot.workspace = workspace;
+
+    if (batch.jobId !== undefined) {
+      slot.itemId = this.db?.addItem(batch.jobId, slot.item.url, {
+        noProxy: slot.item.noProxy,
+        tag: batch.tag,
+      });
+
+      if (slot.itemId !== undefined) {
+        this.db?.setItemResumeDir(slot.itemId, workspace.dirPath);
+      }
+    }
+
+    return workspace;
   }
 
   /**
@@ -757,57 +784,218 @@ export class VideoMessageProcessor {
 
   private async downloadWithRetries(options: {
     slot: PrefetchSlot;
+    userId: string;
     total: number;
-    signal: AbortSignal;
+    batch: BatchOptions;
     reporter: BatchProgressReporter;
   }): Promise<DownloadedVideo> {
-    const { slot, total, signal, reporter } = options;
-    const workspace = slot.workspace;
-
-    if (workspace === undefined) {
-      throw new Error('Workspace unduhan tidak tersedia.');
-    }
+    const { slot, userId, total, batch, reporter } = options;
+    const { signal } = batch;
 
     const maxAttempts = Math.max(1, this.downloadRetries);
-    let lastError: unknown;
+    const startedAt = Date.now();
+    const deadline = this.downloadRetryBudgetMs > 0
+      ? startedAt + this.downloadRetryBudgetMs
+      : Number.POSITIVE_INFINITY;
 
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let lastError: unknown;
+    let lastClassification: DownloadErrorClassification | undefined;
+
+    for (let attempt = 1; ; attempt += 1) {
       if (signal.aborted) {
         throw new DownloadCancelledError();
       }
 
+      // The first attempt always gets a chance to run; later attempts are
+      // refused once the wall-clock budget is gone.
+      if (attempt > 1 && Date.now() >= deadline) {
+        throw this.buildBudgetError(lastError, lastClassification);
+      }
+
+      await this.downloadSlots.acquire(signal);
+
+      let releaseDisk: (() => void) | undefined;
+      let attemptError: unknown;
+
       try {
-        return await this.videoDownloader.download({
-          url: slot.item.url,
-          outputDir: workspace.dirPath,
-          signal,
-          noProxy: slot.item.noProxy,
-          onProgress: (progress) => reporter.update(slot.index, progress),
-        });
-      } catch (error) {
-        if (error instanceof DownloadCancelledError) {
-          throw error;
-        }
+        releaseDisk = await this.reserveDownloadDisk(signal);
+        const workspace = await this.ensureWorkspace(slot, userId, batch);
 
-        lastError = error;
-        console.error(`Download attempt ${attempt}/${maxAttempts} failed for ${slot.item.url}:`, error);
-
-        if (attempt < maxAttempts) {
-          const backoffMs = Math.min(30_000, this.downloadRetryBackoffMs * attempt);
-          await reporter.reportRetry({
-            index: slot.index,
-            attempt,
-            maxAttempts,
-            backoffMs,
-            error,
-            total,
+        try {
+          return await this.videoDownloader.download({
+            url: slot.item.url,
+            outputDir: workspace.dirPath,
+            signal,
+            noProxy: slot.item.noProxy,
+            onProgress: (progress) => reporter.update(slot.index, progress),
           });
-          await this.delay(backoffMs, signal);
+        } catch (error) {
+          if (error instanceof DownloadCancelledError) {
+            throw error;
+          }
+          attemptError = error;
         }
+      } finally {
+        releaseDisk?.();
+        // Released even when the download failed, so the next prefetched link
+        // (or another chat's link) can start during the retry wait.
+        this.downloadSlots.release();
+      }
+
+      lastError = attemptError;
+
+      const proxyActive = this.usesProxy(slot);
+      const classification = classifyDownloadError(attemptError, { proxyActive });
+      lastClassification = classification;
+
+      console.error(
+        `Download attempt ${attempt}/${maxAttempts} failed for ${slot.item.url} (${classification.kind}):`,
+        attemptError,
+      );
+
+      if (!classification.retryable || attempt >= maxAttempts) {
+        throw this.buildFailure(classification, attemptError);
+      }
+
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        throw this.buildBudgetError(attemptError, classification);
+      }
+
+      if (classification.kind === 'proxy' && proxyActive && this.downloadProxyWaitMs > 0) {
+        const waitMs = Math.min(this.downloadProxyWaitMs, remainingMs);
+        await reporter.reportProxyWait({
+          index: slot.index,
+          attempt,
+          maxAttempts,
+          waitMs,
+          total,
+          reason: classification.reason,
+        });
+
+        const ready = await waitForProxyReady({
+          proxyUrl: this.proxy ?? '',
+          signal,
+          timeoutMs: waitMs,
+          onWait: (elapsedMs) => {
+            void reporter.reportProxyWait({
+              index: slot.index,
+              attempt,
+              maxAttempts,
+              waitMs,
+              elapsedMs,
+              total,
+              reason: classification.reason,
+            }).catch((error) => {
+              console.error('Failed to report proxy readiness:', error);
+            });
+          },
+        });
+
+        if (!ready) {
+          throw new DownloadFailure(
+            `Proxy lokal masih menolak koneksi setelah ${Math.max(1, Math.round(waitMs / 1000))} detik. Periksa proxy/WARP, atau kirim ulang dengan noproxy <link> jika link bisa diakses langsung.`,
+            { kind: 'proxy', retryable: false, cause: attemptError },
+          );
+        }
+
+        // Give the freshly restarted proxy a moment to finish initialising.
+        await this.delay(Math.min(250, Math.max(0, deadline - Date.now())), signal);
+        continue;
+      }
+
+      const backoffMs = this.backoffForAttempt(attempt, remainingMs);
+      await reporter.reportRetry({
+        index: slot.index,
+        attempt,
+        maxAttempts,
+        backoffMs,
+        error: attemptError,
+        total,
+        reason: classification.reason,
+        kind: classification.kind,
+      });
+      await this.delay(backoffMs, signal);
+    }
+  }
+
+  /** Exponential backoff with a small jitter, capped at 60s and the budget. */
+  private backoffForAttempt(attempt: number, remainingMs: number): number {
+    const base = Math.min(60_000, this.downloadRetryBackoffMs * 2 ** (attempt - 1));
+    const jitter = base > 0 ? Math.floor(base * 0.2 * Math.random()) : 0;
+    return Math.max(0, Math.min(remainingMs, base + jitter));
+  }
+
+  private buildFailure(
+    classification: DownloadErrorClassification,
+    error: unknown,
+  ): DownloadFailure {
+    return new DownloadFailure(classification.reason, {
+      kind: classification.kind,
+      retryable: classification.retryable,
+      cause: error,
+    });
+  }
+
+  private buildBudgetError(
+    error: unknown,
+    classification: DownloadErrorClassification | undefined,
+  ): DownloadFailure {
+    const minutes = this.downloadRetryBudgetMs / 60_000;
+    const budget = minutes >= 1
+      ? `${Math.round(minutes)} menit`
+      : `${Math.max(1, Math.round(this.downloadRetryBudgetMs / 1000))} detik`;
+    const reason = classification?.reason ?? summarizeErrorMessage(error);
+    return new DownloadFailure(
+      `${reason} Batas waktu retry ${budget} habis. Kirim ulang link ini untuk melanjutkan dari posisi terakhir.`,
+      {
+        kind: classification?.kind ?? 'transient',
+        retryable: true,
+        cause: error,
+      },
+    );
+  }
+
+  private usesProxy(slot: PrefetchSlot): boolean {
+    return slot.item.noProxy !== true && this.proxy !== undefined && this.proxy.trim() !== '';
+  }
+
+  /**
+   * Hint shown below a failed link. A permanent failure must not invite a
+   * pointless resend, and a dead proxy should be fixed (or bypassed with
+   * `noproxy <link>`) instead of retrying the same URL forever.
+   */
+  private failureHint(error: unknown): string {
+    if (error instanceof DownloadFailure) {
+      if (error.kind === 'proxy') {
+        return 'Periksa proxy/WARP, atau kirim ulang dengan noproxy <link> jika link bisa diakses langsung.';
+      }
+
+      if (error.kind === 'permanent') {
+        return 'Tidak akan dicoba ulang.';
       }
     }
 
-    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    return 'Kirim ulang link ini untuk melanjutkan dari posisi terakhir.';
+  }
+
+  /** Mark permanent/proxy failures in the final multi-link summary too. */
+  private failureSummaryReason(error: unknown): string {
+    const reason = summarizeErrorMessage(error);
+
+    if (error instanceof DownloadFailure) {
+      if (error.kind === 'permanent') {
+        return `${reason} (tidak akan dicoba ulang)`;
+      }
+
+      if (error.kind === 'proxy') {
+        return reason.includes('noproxy')
+          ? reason
+          : `${reason} (periksa proxy/WARP atau coba noproxy)`;
+      }
+    }
+
+    return reason;
   }
 
   /** Abortable sleep used between download retry attempts. */

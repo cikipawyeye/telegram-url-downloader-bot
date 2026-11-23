@@ -63,7 +63,7 @@ Antrean FIFO per chat sekarang hanya mengatur **pengiriman**, bukan unduhan:
 
 Batasnya:
 - `DOWNLOAD_CONCURRENCY` (default `1`) — jumlah unduhan bersamaan untuk **seluruh** chat. Nilai `1` sudah membuat unduhan link berikutnya jalan selagi link sekarang dikirim.
-- `DOWNLOAD_TIMEOUT_MS` (default 15 menit) — batas waktu satu percobaan unduhan. Satu link yang macet akan dicoba ulang otomatis sampai total `DOWNLOAD_RETRIES` percobaan (default 10) dengan jeda `DOWNLOAD_RETRY_BACKOFF_MS` (default 2 detik). Karena percobaan ulang memakai slot global, tekan ⏹ Hentikan Unduhan kalau link benar-benar mati agar chat lain tidak menunggu.
+- `DOWNLOAD_TIMEOUT_MS` (default 15 menit) — batas waktu satu percobaan unduhan. Error permanen (video privat/unavailable, login/usia, geo-block, HTTP 400/401/403/404/410/451, format tidak didukung) langsung gagal tanpa retry. Error sementara dicoba ulang sampai total `DOWNLOAD_RETRIES` percobaan (default 3) dengan backoff eksponensial dari `DOWNLOAD_RETRY_BACKOFF_MS` (default 2 detik, maksimal 60 detik). Jeda retry dan dimulainya percobaan berikutnya dibatasi `DOWNLOAD_RETRY_BUDGET_MS` (default 30 menit); percobaan yang sedang berjalan tetap tunduk pada `DOWNLOAD_TIMEOUT_MS`. Slot download global dilepas selama jeda sehingga link yang menunggu retry tidak memblokir chat lain. Jika `YTDLP_PROXY` menolak koneksi, bot menunggu port proxy lokal siap (probe TCP, default maksimal `DOWNLOAD_PROXY_WAIT_MS` 120 detik) lalu mencoba lagi; penantian ini tetap dihitung terhadap budget.
 - `MIN_FREE_DISK_BYTES` (default 6 GiB) dan `DOWNLOAD_RESERVE_BYTES` (default 4 GiB) — sebelum unduhan dimulai, bot memastikan sisa disk masih cukup. Untuk video 4 GB+ yang dipecah menjadi part, satu job butuh ruang untuk file asli **dan** hasil split (sekitar 2x ukuran file), jadi naikkan `MIN_FREE_DISK_BYTES` bila ukuran file biasanya 4 GB atau lebih (mis. `12884901888` = 12 GiB).
 - Kalau ruang tidak cukup, link tersebut gagal dengan alasan yang jelas (bukan error ffmpeg/ENOSPC), dan pesan menyebutkan berapa GB yang tersedia/dibutuhkan.
 - Kalau ruang sedang penuh karena file yang baru dikirim belum dihapus, bot menunggu sekitar 15 detik (sampai 4 kali percobaan) sebelum menyatakan link gagal, sehingga batch video besar di disk ketat tidak langsung putus. Tombol Stop tetap bisa menghentikan penantian ini.
@@ -92,7 +92,10 @@ Batas ukuran upload (`MAX_FILE_SIZE_BYTES`):
 Konfigurasi lain yang sering disesuaikan:
 - `SCREENSHOT_COUNT` — jumlah screenshot, default `5`, otomatis dibatasi 1–9
 - `DOWNLOAD_TIMEOUT_MS` — batas satu percobaan unduhan, default `900000` (15 menit)
-- `DOWNLOAD_RETRIES` / `DOWNLOAD_RETRY_BACKOFF_MS` — jumlah percobaan dan jeda antar percobaan, default `10` dan `2000`
+- `DOWNLOAD_RETRIES` — total percobaan per link, default `3`; error permanen tetap gagal setelah percobaan pertama
+- `DOWNLOAD_RETRY_BACKOFF_MS` — basis jeda retry, default `2000`; jeda berlipat `2s, 4s, ...` dengan batas 60 detik dan jitter
+- `DOWNLOAD_RETRY_BUDGET_MS` — batas jeda retry dan dimulainya percobaan berikutnya per link, default `1800000` (30 menit); `0` menonaktifkan batas
+- `DOWNLOAD_PROXY_WAIT_MS` — lama menunggu proxy lokal siap setelah `connection refused`, default `120000` (2 menit); `0` melewati penantian
 - `MAX_BULK_URLS` — jumlah link maksimal per pesan, default `20`
 - `WEBHOOK_SECRET_TOKEN` — opsional, lihat bagian Reverse proxy
 

@@ -1,4 +1,5 @@
 import type { StatusMessage, TelegramNotifier } from '../telegram/notifier.js';
+import type { DownloadErrorKind } from './download-errors.js';
 import { formatDownloadProgress, summarizeErrorMessage, type VideoDownloadProgress } from './utils.js';
 
 /**
@@ -61,6 +62,9 @@ export class BatchProgressReporter {
     backoffMs: number;
     error: unknown;
     total: number;
+    /** Short classification reason; falls back to the raw error message. */
+    reason?: string;
+    kind?: DownloadErrorKind;
   }): Promise<void> {
     if (options.index !== this.currentIndex) {
       return;
@@ -72,9 +76,48 @@ export class BatchProgressReporter {
       ? `Attempt ${options.attempt}/${options.maxAttempts} gagal (link ${options.index + 1}/${options.total}):`
       : `Attempt ${options.attempt}/${options.maxAttempts} gagal:`;
 
+    const action = options.kind === 'proxy'
+      ? `Mencoba lagi dalam ${Math.round(options.backoffMs / 1000)} detik...`
+      : `Melanjutkan dari posisi terakhir dalam ${Math.round(options.backoffMs / 1000)} detik...`;
+
     await this.notifier.updateStatus(
       this.statusMessage,
-      `${header} ${summarizeErrorMessage(options.error)}\nMelanjutkan dari posisi terakhir dalam ${Math.round(options.backoffMs / 1000)} detik...`,
+      `${header} ${options.reason ?? summarizeErrorMessage(options.error)}\n${action}`,
+    );
+  }
+
+  /**
+   * Explain that the download is paused while a refusing local proxy is probed.
+   * Only the link the delivery loop is currently waiting on gets status text, so
+   * a background retry never clobbers another link's progress.
+   */
+  async reportProxyWait(options: {
+    index: number;
+    attempt: number;
+    maxAttempts: number;
+    waitMs: number;
+    elapsedMs?: number;
+    total: number;
+    reason: string;
+  }): Promise<void> {
+    if (options.index !== this.currentIndex) {
+      return;
+    }
+
+    this.latest.delete(options.index);
+
+    const header = options.total > 1
+      ? `Attempt ${options.attempt}/${options.maxAttempts} gagal (link ${options.index + 1}/${options.total}):`
+      : `Attempt ${options.attempt}/${options.maxAttempts} gagal:`;
+
+    const totalSeconds = Math.max(1, Math.round(options.waitMs / 1000));
+    const progress = options.elapsedMs === undefined
+      ? `maksimal ${totalSeconds} detik`
+      : `${Math.min(totalSeconds, Math.round(options.elapsedMs / 1000))}/${totalSeconds} detik`;
+
+    await this.notifier.updateStatus(
+      this.statusMessage,
+      `${header} ${options.reason}\nMenunggu proxy lokal siap (${progress})...`,
     );
   }
 
