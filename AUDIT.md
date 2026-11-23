@@ -175,7 +175,7 @@ dengan local Bot API server.
 | R2 | `probe` audio tidak menerima signal | ✅ |
 | R3 | Antrean media per-chat tanpa timeout | ⬜ |
 | R4 | `deleteStatus` gagal tidak menampilkan status akhir | ✅ tidak lagi mengunci pesan berikutnya |
-| R5 | README menyebut Stop menyimpan partial; kode menghapus hasil prefetch yang belum terkirim | ⬜ dokumentasi perlu diselaraskan |
+| R5 | Dokumentasi usang (default 2 GB, tanpa `WEBHOOK_SECRET_TOKEN`, perilaku Stop/restart) | ✅ README dan `.env.example` diselaraskan dengan kode |
 
 ---
 
@@ -190,3 +190,7 @@ dengan local Bot API server.
 - Splitter diuji dengan MKV ber-subtitle ASS: part berhasil dibuat (sebelumnya
   0 byte) dan direktori retry lama dibersihkan.
 - `buildDeliveryFileName` diuji untuk judul yang sudah berisi ekstensi.
+- `README.md` dan `.env.example` dicek ulang terhadap `config.ts` dan perilaku
+  kode: default `MAX_FILE_SIZE_BYTES` (50 MiB standar / 2 GiB local Bot API),
+  `DOWNLOAD_TIMEOUT_MS`, retry, `SCREENSHOT_COUNT`, `MAX_BULK_URLS`,
+  `WEBHOOK_SECRET_TOKEN`, port Compose, dan perilaku Stop/restart.

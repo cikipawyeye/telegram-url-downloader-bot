@@ -4,7 +4,7 @@ Bot ini menerima URL dari user, mencoba mengunduh videonya dengan `yt-dlp`, lalu
 
 ## Fitur
 - menerima link dari user via Telegram
-- bulk download hingga 20 URL dalam satu pesan; unduhan link berikutnya sudah jalan (prefetch) selagi link sebelumnya dikonversi/dikirim, sedangkan pengiriman ke Telegram tetap berurutan
+- bulk download hingga 20 URL dalam satu pesan (bisa diubah lewat `MAX_BULK_URLS`); unduhan link berikutnya sudah jalan (prefetch) selagi link sebelumnya dikonversi/dikirim, sedangkan pengiriman ke Telegram tetap berurutan
 - webhook-ready untuk deployment
 - download dengan `yt-dlp`
 - perintah `/audio`: balas (reply) pesan video dari bot untuk mengekstrak audionya lalu mengirimnya kembali sebagai MP3
@@ -42,7 +42,7 @@ Alur request tetap sama:
 2. Server menerima webhook Telegram
 3. Server menjalankan `yt-dlp`
 4. File disimpan sementara
-5. Bot membuat 5 screenshot dari durasi video
+5. Bot membuat screenshot dari durasi video (`SCREENSHOT_COUNT`, default 5, maksimal 9)
 6. Kalau video melebihi `MAX_FILE_SIZE_BYTES`, bot memecah video menjadi beberapa part dengan `ffmpeg`
 7. Bot mengirim screenshot lalu video ke user
 8. File sementara dihapus
@@ -63,30 +63,43 @@ Antrean FIFO per chat sekarang hanya mengatur **pengiriman**, bukan unduhan:
 
 Batasnya:
 - `DOWNLOAD_CONCURRENCY` (default `1`) — jumlah unduhan bersamaan untuk **seluruh** chat. Nilai `1` sudah membuat unduhan link berikutnya jalan selagi link sekarang dikirim.
+- `DOWNLOAD_TIMEOUT_MS` (default 15 menit) — batas waktu satu percobaan unduhan. Satu link yang macet akan dicoba ulang otomatis sampai total `DOWNLOAD_RETRIES` percobaan (default 10) dengan jeda `DOWNLOAD_RETRY_BACKOFF_MS` (default 2 detik). Karena percobaan ulang memakai slot global, tekan ⏹ Hentikan Unduhan kalau link benar-benar mati agar chat lain tidak menunggu.
 - `MIN_FREE_DISK_BYTES` (default 6 GiB) dan `DOWNLOAD_RESERVE_BYTES` (default 4 GiB) — sebelum unduhan dimulai, bot memastikan sisa disk masih cukup. Untuk video 4 GB+ yang dipecah menjadi part, satu job butuh ruang untuk file asli **dan** hasil split (sekitar 2x ukuran file), jadi naikkan `MIN_FREE_DISK_BYTES` bila ukuran file biasanya 4 GB atau lebih (mis. `12884901888` = 12 GiB).
 - Kalau ruang tidak cukup, link tersebut gagal dengan alasan yang jelas (bukan error ffmpeg/ENOSPC), dan pesan menyebutkan berapa GB yang tersedia/dibutuhkan.
 - Kalau ruang sedang penuh karena file yang baru dikirim belum dihapus, bot menunggu sekitar 15 detik (sampai 4 kali percobaan) sebelum menyatakan link gagal, sehingga batch video besar di disk ketat tidak langsung putus. Tombol Stop tetap bisa menghentikan penantian ini.
 - Saat pengguna menekan Stop: pesan status langsung berubah menjadi "Unduhan dihentikan." dan tombolnya hilang, termasuk untuk pesan yang masih antre (tidak menunggu batch sebelumnya selesai). Unduhan yang sudah selesai tetapi belum terkirim dihapus, sedangkan unduhan yang masih berjalan dibiarkan sebagai file parsial supaya bisa dilanjutkan saat link dikirim ulang.
 
 ## Penting
-Agar bot bisa mengirim file besar, sebaiknya gunakan **local/self-hosted Telegram Bot API** dan isi `TELEGRAM_API_ROOT`.
+Agar bot bisa mengirim file besar, gunakan **local/self-hosted Telegram Bot API** dan isi `TELEGRAM_API_ROOT`.
 
 Contoh:
 - `TELEGRAM_API_ROOT=http://127.0.0.1:8081`
 
-Kalau pakai Bot API Telegram standar, limit upload bot jauh lebih kecil.
+Bot API Telegram standar hanya menerima upload bot sampai **50 MB** dan download file sampai **20 MB**. Tanpa `TELEGRAM_API_ROOT`, `MAX_FILE_SIZE_BYTES` karena itu default ke 50 MiB; video yang lebih besar dipecah menjadi beberapa part selama masih di bawah batas tersebut.
 
-Sebelum menjalankan local bot, logout di API Telegram standar: `curl "https://api.telegram.o
-rg/bot<TOKEN>/logOut"`
+Sebelum menjalankan local bot, logout di API Telegram standar: `curl "https://api.telegram.org/bot<TOKEN>/logOut"`
 
 See: https://github.com/tdlib/telegram-bot-api
 
 ## Environment
-Salin `.env.example` menjadi `.env` lalu isi nilainya.
+Salin `.env.example` menjadi `.env` lalu isi nilainya. Semua nilai numerik divalidasi; nilai kosong atau tidak valid memakai default.
 
-`MAX_FILE_SIZE_BYTES` default-nya `2147483648` (2 GiB). Video yang lebih besar dari nilai ini akan dikirim sebagai beberapa part.
+Batas ukuran upload (`MAX_FILE_SIZE_BYTES`):
+- tanpa `TELEGRAM_API_ROOT`: default `52428800` (50 MiB, batas Bot API standar)
+- dengan `TELEGRAM_API_ROOT`: default `2147483648` (2 GiB)
+- video yang lebih besar dari nilai ini dipecah menjadi beberapa part; nilai ini juga dipakai sebagai batas ukuran video sumber untuk `/audio`
+
+Konfigurasi lain yang sering disesuaikan:
+- `SCREENSHOT_COUNT` — jumlah screenshot, default `5`, otomatis dibatasi 1–9
+- `DOWNLOAD_TIMEOUT_MS` — batas satu percobaan unduhan, default `900000` (15 menit)
+- `DOWNLOAD_RETRIES` / `DOWNLOAD_RETRY_BACKOFF_MS` — jumlah percobaan dan jeda antar percobaan, default `10` dan `2000`
+- `MAX_BULK_URLS` — jumlah link maksimal per pesan, default `20`
+- `WEBHOOK_SECRET_TOKEN` — opsional, lihat bagian Reverse proxy
 
 ## Menjalankan lokal
+
+Prasyarat: **Node.js >= 22.5** (bot memakai modul bawaan `node:sqlite`), `ffmpeg`, `yt-dlp`, dan opsional `aria2c` (magnet) serta `gdown` (Google Drive).
+
 ```bash
 npm install
 cp .env.example .env
@@ -98,6 +111,8 @@ npm run dev
 cp .env.example .env
 docker compose up -d --build
 ```
+
+`docker-compose.yml` memakai `${PORT}` untuk port host **dan** container sekaligus, jadi ubah `PORT` di `.env` bila port default bentrok. Compose membaca `.env` di direktori yang sama; `docker compose config` bisa dipakai untuk memastikan nilai yang dipakai sudah benar.
 
 ## Cloudflare WARP proxy dengan systemd
 Proxy dapat diterapkan hanya ke trafik `yt-dlp`, sehingga webhook dan koneksi Telegram tidak ikut melewati WARP.
@@ -146,7 +161,8 @@ Detail teknis:
 - Video diambil lewat `getFile`: dengan local Bot API server (`TELEGRAM_API_ROOT`), `file_path` adalah lokasi file di server sehingga langsung disalin dari disk; tanpa itu (Bot API standar), file diunduh lewat HTTP dari `<API_ROOT>/file/bot<TOKEN>/<path>`.
 - Bot API standar hanya bisa mengunduh file sampai **20 MB**. Kalau video yang di-reply lebih besar dari itu dan bot memakai Bot API standar, proses gagal cepat dengan pesan yang menyarankan `TELEGRAM_API_ROOT`. (Local Bot API server bisa mengunduh tanpa batas ukuran juga untuk audio ini.)
 - Audio dikirim memakai antrian media yang sama seperti video/screenshot sehingga urutan pesan per chat tetap konsisten.
-- Seperti unduhan video, proses `/audio` menampilkan progres (mengambil file → mengekstrak → mengirim) dan punya tombol ⏹ Hentikan Unduhan yang bisa dibatalkan lewat pesan status. Catatan: alur ini stateless dan tidak dicatat di tabel `jobs`/`job_items` (tabel itu khusus batch URL).
+- Proses `/audio` berjalan di background: handler langsung mengembalikan respons ke Telegram, lalu progres dan hasil dikirim lewat pesan status. Ini mencegah ekstraksi file besar menahan webhook sampai timeout dan diproses dua kali.
+- Seperti unduhan video, proses `/audio` menampilkan progres (mengambil file → mengekstrak → mengirim) dan punya tombol ⏹ Hentikan Unduhan yang bisa dibatalkan lewat pesan status. Kalau ukuran video sumber diketahui dan melebihi `MAX_FILE_SIZE_BYTES`, proses gagal cepat sebelum mengunduh. Catatan: alur ini stateless dan tidak dicatat di tabel `jobs`/`job_items` (tabel itu khusus batch URL).
 
 ## Tag unduhan (`/tag` & `/tags`)
 Tag adalah label yang menempel pada unduhan, berguna untuk mengelompokkan dan mencari riwayat link yang pernah dikirim.
@@ -204,6 +220,15 @@ Arahkan domain HTTPS kamu ke port aplikasi, lalu set:
 
 Webhook akan dibuat otomatis ke:
 `/telegram/webhook/<WEBHOOK_SECRET>`
+
+Opsional, lapisan autentikasi kedua: isi `WEBHOOK_SECRET_TOKEN` dengan string acak. Nilai itu dikirim ke `setWebhook` sebagai `secret_token`, dan Telegram mengembalikannya di header `X-Telegram-Bot-Api-Secret-Token` pada setiap update; request tanpa token yang cocok ditolak. Kosongkan untuk mempertahankan perilaku lama.
+
+## Database & pemulihan setelah restart
+- Riwayat job dan tag disimpan di SQLite (`DB_PATH`, default `$DOWNLOAD_DIR/bot.db`).
+- Skema v5 memakai `UNIQUE(chat_id, status_message_id)` karena message id Telegram hanya unik di dalam satu chat.
+- Job yang sukses ditutup sebagai `completed`; job yang gagal total sebagai `failed`.
+- Saat startup, job yang masih `running` dari proses sebelumnya ditandai `failed`. Item yang belum selesai ikut ditandai gagal dan file parsialnya dipertahankan, sehingga mengirim ulang link yang sama melanjutkan unduhan dari posisi terakhir, bukan dari nol.
+- Stop menyimpan unduhan yang sedang berjalan sebagai file parsial untuk resume, sedangkan unduhan prefetch yang sudah selesai tetapi belum sempat dikirim dihapus agar disk tidak penuh.
 
 ## Health check
 - `GET /health`
